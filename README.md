@@ -13,8 +13,7 @@ $ heard -f          # follow live, with an in-progress line for whoever is talki
 ```
 
 Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from screen sharing, with the
-Listening switch, the live transcript, search, and three AI buttons over the last minutes of conversation
-(Assist: "what should I say next?", Ask, Recap) answered by Claude when you press them.
+Listening switch, the live transcript, search, and Save.
 
 - **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records the system's default output, not
   a particular app.
@@ -42,8 +41,8 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 - **Short memory.** Lines older than 3 days are deleted (`HEARD_RETENTION_DAYS`). Audio is never stored.
 - **Owner-only files.** The data folder, database, live captions and the overlay's settings are readable only by
   your user. The daemon log contains status lines, never transcript text.
-- **Nothing leaves the machine by default.** The overlay sends the last N minutes of transcript (15 by default)
-  to the Anthropic API only when you press Assist, Ask or Recap, with the API key you pasted in its settings.
+- **Nothing leaves the machine.** No cloud, no AI service, no network access at all beyond the one-time model
+  download.
 - **Hidden from screen sharing.** The overlay window is excluded from screen capture on macOS and Windows.
 
 ## Requirements
@@ -111,12 +110,10 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | Control | |
 |---|---|
 | **● Listening / Paused** (⌘⇧L, Ctrl+Shift+L) | the switch; red while capturing, with the minutes so far |
-| **Assist** (⌘⇧↩, Ctrl+Shift+Enter) | what to say next, from the last minutes of conversation |
-| **Ask…** | a question about the conversation |
-| **Recap** | key points, decisions, open questions, action items |
-| **Save** | the transcript and the last answer as Markdown in your notes folder (`~/Documents/heard`) |
-| transcript pane | lines as they land, the sentence in progress dimmed; search the retained history |
-| ⚙ | API key, your name, minutes of context, notes folder, and a playbook (who you are, what matters on calls) sent with every AI request |
+| search field | search the retained history (Enter); clear it to go back to the live view |
+| **Save** | what is shown, as a Markdown file in your notes folder (`~/Documents/heard`), revealed in Finder / Explorer |
+| transcript pane | lines as they land, the sentence in progress dimmed |
+| ⚙ | the notes folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
 ### The command line

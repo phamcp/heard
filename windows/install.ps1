@@ -43,7 +43,7 @@ Register-ScheduledTask -TaskName "heard" -Action (New-ScheduledTaskAction -Execu
     -Trigger $trigger -Settings $daemonSettings -Force `
     -Description "Local real-time transcript of calls (heard): read-only capture, local Whisper, starts paused" | Out-Null
 Register-ScheduledTask -TaskName "heard-ui" -Action (New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$($launchers['heard-ui'])`"") `
-    -Trigger $trigger -Settings $uiSettings -Force -Description "heard overlay (Listening switch, transcript, Assist)" | Out-Null
+    -Trigger $trigger -Settings $uiSettings -Force -Description "heard overlay (Listening switch, live transcript)" | Out-Null
 Start-ScheduledTask -TaskName "heard"
 Start-ScheduledTask -TaskName "heard-ui"
 Write-Host @"

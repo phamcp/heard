@@ -6,39 +6,32 @@
 #   "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
 # ]
 # ///
-"""heard-ui: a light overlay for heard, in the spirit of Cluely. macOS, Windows, Linux (one Qt script).
+"""heard-ui: a light overlay for heard. macOS, Windows, Linux (one Qt script).
 
 A translucent, always-on-top bar that is excluded from screen sharing, with:
   - the Listening / Paused switch (capture happens only while this is on)
   - the live transcript (lines land a few seconds after someone speaks; the sentence in progress is dimmed)
   - search over the retained history
-  - Assist ("what should I say next?"), Ask (a question about the conversation), Recap, answered by Claude
-    over the Anthropic API with the last minutes of transcript as context: sent only when you press a button
-  - Save: the transcript and the last answer as a Markdown file in your notes folder
+  - Save: the transcript as a Markdown file in your notes folder
   - a tray / menu bar icon that shows whether capture is on
 
-Global hotkeys: ⌘⇧↩ Assist, ⌘⇧H show/hide, ⌘⇧L listening on/off (Ctrl+Shift on Windows). None on Linux.
-Everything reads ~/.local/share/heard (heard.db, live.json, paused, daemon.alive); settings and the API key are in
-ui-config.json there, owner-only.
+Global hotkeys: ⌘⇧H show/hide, ⌘⇧L listening on/off (Ctrl+Shift on Windows). None on Linux.
+Everything reads ~/.local/share/heard (heard.db, live.json, paused, daemon.alive); nothing leaves the machine.
 """
 import ctypes
 import json
 import os
-import platform
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox,
-                               QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QSystemTrayIcon, QTextBrowser,
+                               QVBoxLayout, QWidget)
 
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
@@ -51,21 +44,15 @@ LIVE_PATH = DATA_DIRECTORY / "live.json"
 HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"
 CONFIG_PATH = DATA_DIRECTORY / "ui-config.json"
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
-BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 900, 46, 380
+BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 760, 46, 360
 
-DEFAULT_SETTINGS = {
-    "api_key": "",
-    "user_name": (os.environ.get("USER") or os.environ.get("USERNAME") or "me").capitalize(),
-    "playbook": "",
-    "notes_folder": str(Path.home() / "Documents/heard"),
-    "context_minutes": 15,
-}
+DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard")}
 
 
 def load_settings():
     settings = dict(DEFAULT_SETTINGS)
     try:
-        settings.update(json.loads(CONFIG_PATH.read_text()))
+        settings.update({k: v for k, v in json.loads(CONFIG_PATH.read_text()).items() if k in DEFAULT_SETTINGS})
     except (OSError, ValueError):
         pass
     return settings
@@ -75,10 +62,6 @@ def save_settings(settings):
     DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(settings, indent=2))
     os.chmod(CONFIG_PATH, 0o600)
-
-
-def api_key(settings):
-    return settings.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 # --- transcript -------------------------------------------------------------------------------------
@@ -118,64 +101,10 @@ def stamp(started_at):
     return time.strftime("%H:%M:%S", time.localtime(started_at))
 
 
-# --- Claude (raw HTTP, streaming) --------------------------------------------------------------------
-
-class ClaudeStream(QObject):
-    text = Signal(str)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, body, key):
-        super().__init__()
-        self.body, self.key = body, key
-        self.cancelled = False
-
-    def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _run(self):
-        request = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages", data=json.dumps(self.body).encode(),
-            headers={"Content-Type": "application/json", "x-api-key": self.key,
-                     "anthropic-version": "2023-06-01", "anthropic-beta": "server-side-fallback-2026-07-01"})
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                for raw in response:
-                    if self.cancelled:
-                        return
-                    line = raw.decode("utf-8", "replace").rstrip("\n")
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        event = json.loads(line[6:])
-                    except ValueError:
-                        continue
-                    kind = event.get("type")
-                    if kind == "content_block_delta" and event["delta"].get("type") == "text_delta":
-                        self.text.emit(event["delta"]["text"])
-                    elif kind == "message_delta" and event["delta"].get("stop_reason") == "refusal":
-                        self.text.emit("\n\n(Claude declined to answer this one.)")
-                    elif kind == "error":
-                        self.failed.emit(event.get("error", {}).get("message", "stream error"))
-                        return
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")
-            try:
-                detail = json.loads(detail)["error"]["message"]
-            except (ValueError, KeyError, TypeError):
-                pass
-            self.failed.emit(f"Claude API {error.code}: {detail}")
-        except Exception as error:   # network errors, timeouts
-            self.failed.emit(str(error))
-        finally:
-            self.finished.emit()
-
-
 # --- state --------------------------------------------------------------------------------------------
 
 class Store(QObject):
     changed = Signal()          # transcript / live / listening / daemon state
-    answer_changed = Signal()
     status_changed = Signal(str)
 
     def __init__(self):
@@ -187,12 +116,8 @@ class Store(QObject):
         self.listening = False
         self.listening_since = None
         self.daemon_running = False
-        self.answer = ""
-        self.answer_title = ""
-        self.busy = False
         self.search_results = None
         self.newest = time.time() - 3 * 3600
-        self.stream = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(500)
@@ -238,88 +163,14 @@ class Store(QObject):
         self.search_results = self.transcript.search(query) if query else None
         self.changed.emit()
 
-    # AI
-    def context_text(self):
-        cutoff = time.time() - self.settings["context_minutes"] * 60
-        recent = [line for line in self.lines if line[3] >= cutoff][-150:]
-        if not recent:
-            return f"(nothing has been said in the last {self.settings['context_minutes']} minutes)"
-        return "\n".join(f"{stamp(started)} {speaker}: {text}" for _, speaker, text, started in recent)
-
-    def system_prompt(self):
-        name = self.settings["user_name"]
-        prompt = (f"You sit quietly beside {name} during a live conversation and answer only to them. "
-                  f"The transcript is from heard: \"them\" is the other party (or parties), \"me\" is {name}. "
-                  "Transcription is automatic and imperfect, so read through small errors. "
-                  "Your reply is read mid-conversation: be brief and concrete, two to four short bullets or sentences, "
-                  "no preamble, no restating the transcript.")
-        if self.settings["playbook"].strip():
-            prompt += f"\n\nAbout {name} and what matters on their calls:\n{self.settings['playbook'].strip()}"
-        return prompt
-
-    def assist(self):
-        name = self.settings["user_name"]
-        self.ask("Assist", f"What should {name} say next? Give the two or three most useful things to say or ask "
-                 "right now. If they were just asked a question, lead with a one-line answer to it.", "low")
-
-    def recap(self):
-        self.ask("Recap", "Summarize the conversation so far: key points, decisions, open questions, and action items "
-                 "with owners. Use short Markdown bullets under those four headings; skip a heading that has nothing.",
-                 "medium")
-
-    def ask(self, title, prompt, effort="low"):
-        key = api_key(self.settings)
-        self.answer_title = title
-        if not key:
-            self.answer = "Add your Anthropic API key in Settings (the gear) to use Assist, Ask and Recap."
-            self.answer_changed.emit()
-            return
-        if self.stream:
-            self.stream.cancelled = True
-        self.answer = ""
-        self.busy = True
-        self.answer_changed.emit()
-        minutes = self.settings["context_minutes"]
-        body = {
-            "model": "claude-opus-5-5",
-            "max_tokens": 2048,
-            "stream": True,
-            "fallbacks": "default",
-            "output_config": {"effort": effort},
-            "system": self.system_prompt(),
-            "messages": [{"role": "user",
-                          "content": f"Transcript of the last {minutes} minutes:\n\n{self.context_text()}\n\n{prompt}"}],
-        }
-        stream = ClaudeStream(body, key)
-        stream.text.connect(self._on_text)
-        stream.failed.connect(self._on_failed)
-        stream.finished.connect(self._on_finished)
-        self.stream = stream
-        stream.start()
-
-    def _on_text(self, text):
-        self.answer += text
-        self.answer_changed.emit()
-
-    def _on_failed(self, message):
-        self.answer += f"\n\n⚠️ {message}"
-        self.answer_changed.emit()
-
-    def _on_finished(self):
-        self.busy = False
-        self.answer_changed.emit()
-
-    # notes
     def save_notes(self):
         folder = Path(self.settings["notes_folder"])
         folder.mkdir(parents=True, exist_ok=True)
         now = time.strftime("%Y-%m-%d %H.%M")
         path = folder / f"{now} heard.md"
-        text = f"# heard notes, {now}\n\n"
-        if self.answer:
-            text += f"## {self.answer_title}\n\n{self.answer}\n\n"
-        text += "## Transcript\n\n" + "\n".join(
-            f"- {stamp(started)} **{speaker}**: {line}" for _, speaker, line, started in self.lines) + "\n"
+        shown = self.search_results if self.search_results is not None else self.lines
+        text = f"# heard transcript, {now}\n\n" + "\n".join(
+            f"- {stamp(started)} **{speaker}**: {line}" for _, speaker, line, started in shown) + "\n"
         try:
             path.write_text(text)
             os.chmod(path, 0o600)
@@ -351,7 +202,7 @@ def open_folder(path):
 # --- global hotkeys (no permissions needed): Carbon on macOS, RegisterHotKey on Windows ----------------
 
 class HotKeys:
-    ASSIST, TOGGLE_VISIBLE, TOGGLE_LISTENING = 1, 2, 3
+    TOGGLE_VISIBLE, TOGGLE_LISTENING = 1, 2
 
     def __init__(self, app, callback):
         self.callback = callback
@@ -395,16 +246,17 @@ class HotKeys:
         carbon.InstallEventHandler(target, handler_c, 1, ctypes.byref(spec), None, None)
         self._keep += [handler_c, spec]
         command_shift = (1 << 8) | (1 << 9)
-        for key_id, key_code in ((self.ASSIST, 36), (self.TOGGLE_VISIBLE, 4), (self.TOGGLE_LISTENING, 37)):   # ↩ H L
+        for key_id, key_code in ((self.TOGGLE_VISIBLE, 4), (self.TOGGLE_LISTENING, 37)):   # H, L
             ref = ctypes.c_void_p()
             carbon.RegisterEventHotKey(key_code, command_shift, EventHotKeyID(0x48454152, key_id), target, 0,
                                        ctypes.byref(ref))
             self._keep.append(ref)
 
     def _windows(self, app):
+        import ctypes.wintypes
         user32 = ctypes.windll.user32
         mod_control_shift = 0x0002 | 0x0004
-        for key_id, virtual_key in ((self.ASSIST, 0x0D), (self.TOGGLE_VISIBLE, 0x48), (self.TOGGLE_LISTENING, 0x4C)):
+        for key_id, virtual_key in ((self.TOGGLE_VISIBLE, 0x48), (self.TOGGLE_LISTENING, 0x4C)):   # H, L
             user32.RegisterHotKey(None, key_id, mod_control_shift | 0x4000, virtual_key)   # MOD_NOREPEAT
 
         callback = self.callback
@@ -416,7 +268,6 @@ class HotKeys:
                     callback(int(msg.wParam))
                 return False, 0
 
-        import ctypes.wintypes  # noqa: F401  (needed for MSG)
         self._filter = Filter()
         app.installNativeEventFilter(self._filter)
 
@@ -427,15 +278,11 @@ STYLE = """
 QWidget { color: #ececec; font-size: 12px; }
 QPushButton { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
 QPushButton:hover { background: rgba(255,255,255,0.17); }
-QPushButton#assist { background: #3d7bf0; font-weight: 600; }
-QPushButton#assist:hover { background: #5b90f5; }
 QPushButton#icon { background: transparent; color: #9c9c9c; padding: 4px 6px; font-size: 13px; }
 QPushButton#icon:hover { color: #ffffff; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
-QLineEdit#search { border-radius: 8px; padding: 4px 8px; font-size: 11px; }
 QTextBrowser { background: transparent; border: none; }
 QLabel#status { color: #9c9c9c; font-size: 10px; }
-QLabel#title { color: #9c9c9c; font-size: 11px; font-weight: 600; }
 QScrollBar:vertical { background: transparent; width: 8px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,0.18); border-radius: 4px; min-height: 20px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -466,14 +313,12 @@ class Overlay(QWidget):
         self.drag_offset = None
 
         self.listen_button = pill("", store.toggle_listening, tooltip=f"Start / stop capturing ({MOD}L)")
-        self.assist_button = pill(f"✦ Assist   {MOD}↩", store.assist, "assist", "What should I say next?")
-        self.question = QLineEdit()
-        self.question.setPlaceholderText("Ask about the conversation…")
-        self.question.returnPressed.connect(self.ask)
-        self.question.setMinimumWidth(200)
-        self.question.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.recap_button = pill("Recap", store.recap, tooltip="Summarize the conversation so far")
-        self.save_button = pill("Save", store.save_notes, tooltip="Save transcript and answer as Markdown")
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search the retained history…  (Enter; clear to go back live)")
+        self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.search.returnPressed.connect(lambda: store.search(self.search.text()))
+        self.search.textChanged.connect(lambda text: store.search("") if not text else None)
+        self.save_button = pill("Save", store.save_notes, tooltip="Save what is shown as a Markdown file")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
         self.settings_button = pill("⚙", open_settings, "icon", "Settings")
         self.hide_button = pill("✕", hide_me, "icon", f"Hide ({MOD}H)")
@@ -481,51 +326,23 @@ class Overlay(QWidget):
         bar = QHBoxLayout()
         bar.setContentsMargins(12, 0, 8, 0)
         bar.setSpacing(8)
-        for widget in (self.listen_button, self.assist_button, self.question, self.recap_button, self.save_button,
-                       self.expand_button, self.settings_button, self.hide_button):
+        for widget in (self.listen_button, self.search, self.save_button, self.expand_button,
+                       self.settings_button, self.hide_button):
             bar.addWidget(widget)
         bar_widget = QWidget()
         bar_widget.setLayout(bar)
         bar_widget.setFixedHeight(BAR_HEIGHT)
 
-        self.search = QLineEdit()
-        self.search.setObjectName("search")
-        self.search.setPlaceholderText("Search the retained history…  (Enter; clear to go back live)")
-        self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.transcript_view = QTextBrowser()
         self.transcript_view.setOpenLinks(False)
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(6)
-        left.addWidget(self.search)
-        left.addWidget(self.transcript_view)
-
-        self.answer_title = QLabel("Assist")
-        self.answer_title.setObjectName("title")
-        self.answer_view = QTextBrowser()
-        self.answer_view.setOpenExternalLinks(True)
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(6)
-        right.addWidget(self.answer_title)
-        right.addWidget(self.answer_view)
-        right_widget = QWidget()
-        right_widget.setLayout(right)
-        right_widget.setFixedWidth(320)
-
-        panes = QHBoxLayout()
-        panes.setContentsMargins(12, 8, 12, 4)
-        panes.setSpacing(14)
-        panes.addLayout(left, 1)
-        panes.addWidget(right_widget)
         self.status = QLabel("")
         self.status.setObjectName("status")
         self.status.setContentsMargins(14, 0, 14, 6)
         self.pane = QWidget()
         pane_layout = QVBoxLayout()
-        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.setContentsMargins(12, 6, 12, 0)
         pane_layout.setSpacing(0)
-        pane_layout.addLayout(panes, 1)
+        pane_layout.addWidget(self.transcript_view, 1)
         pane_layout.addWidget(self.status)
         self.pane.setLayout(pane_layout)
 
@@ -538,10 +355,8 @@ class Overlay(QWidget):
 
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=hide_me)
         store.changed.connect(self.render_state)
-        store.answer_changed.connect(self.render_answer)
         store.status_changed.connect(self.status.setText)
         self.render_state()
-        self.render_answer()
         self.apply_size()
 
     # window chrome
@@ -571,19 +386,11 @@ class Overlay(QWidget):
     def apply_size(self):
         self.pane.setVisible(self.expanded)
         self.expand_button.setText("⌃" if self.expanded else "⌄")
-        height = BAR_HEIGHT + (PANE_HEIGHT if self.expanded else 0)
-        self.setFixedSize(BAR_WIDTH, height)
+        self.setFixedSize(BAR_WIDTH, BAR_HEIGHT + (PANE_HEIGHT if self.expanded else 0))
 
     def place_at_top(self):
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(QPoint(screen.center().x() - BAR_WIDTH // 2, screen.top() + 10))
-
-    # actions
-    def ask(self):
-        text = self.question.text().strip()
-        if text:
-            self.question.clear()
-            self.store.ask(text, text)
 
     # rendering
     def render_state(self):
@@ -624,19 +431,6 @@ class Overlay(QWidget):
             if at_bottom or store.search_results is not None:
                 bar.setValue(bar.maximum())
 
-    def render_answer(self):
-        store = self.store
-        title = store.answer_title or "Assist"
-        self.answer_title.setText(("⏳ " if store.busy else "✦ ") + title)
-        if store.answer:
-            self.answer_view.setMarkdown(store.answer)
-        elif store.busy:
-            self.answer_view.setPlainText("")
-        else:
-            self.answer_view.setMarkdown(f"**Assist** ({MOD}↩) suggests what to say next. **Ask** takes a question about "
-                                         "the conversation. **Recap** summarizes it. The transcript goes to Claude only "
-                                         "when you press one of these.")
-
 
 def escape(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -648,35 +442,19 @@ class SettingsDialog(QDialog):
         self.store = store
         self.setWindowTitle("Heard settings")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        settings = store.settings
-        self.key = QLineEdit(settings["api_key"])
-        self.key.setEchoMode(QLineEdit.Password)
-        self.key.setPlaceholderText("sk-ant-…  (or set ANTHROPIC_API_KEY)")
-        self.name = QLineEdit(settings["user_name"])
-        self.minutes = QSpinBox()
-        self.minutes.setRange(2, 60)
-        self.minutes.setValue(int(settings["context_minutes"]))
-        self.folder = QLineEdit(settings["notes_folder"])
+        self.folder = QLineEdit(store.settings["notes_folder"])
         browse = QPushButton("Choose…")
         browse.clicked.connect(self.choose_folder)
         folder_row = QHBoxLayout()
         folder_row.addWidget(self.folder)
         folder_row.addWidget(browse)
-        self.playbook = QPlainTextEdit(settings["playbook"])
-        self.playbook.setPlaceholderText("Who you are, what you sell, what to listen for on calls. Sent to Claude with "
-                                         "every Assist / Ask / Recap.")
-        self.playbook.setMinimumHeight(120)
         form = QFormLayout()
-        form.addRow("Anthropic API key", self.key)
-        note = QLabel("Kept owner-only in ~/.local/share/heard/ui-config.json. The transcript is sent to Claude only "
-                      "when you press Assist, Ask or Recap, and only the last N minutes.")
+        form.addRow("Notes folder (Save writes here)", folder_row)
+        note = QLabel(f"The transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is deleted "
+                      "after a few days. Nothing leaves the machine.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", note)
-        form.addRow("Your first name", self.name)
-        form.addRow("Minutes of transcript sent", self.minutes)
-        form.addRow("Notes folder", folder_row)
-        form.addRow("Your playbook", self.playbook)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
@@ -684,7 +462,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
-        self.resize(520, 420)
+        self.resize(480, 150)
 
     def choose_folder(self):
         chosen = QFileDialog.getExistingDirectory(self, "Notes folder", self.folder.text())
@@ -692,13 +470,7 @@ class SettingsDialog(QDialog):
             self.folder.setText(chosen)
 
     def save(self):
-        self.store.settings.update({
-            "api_key": self.key.text().strip(),
-            "user_name": self.name.text().strip() or "me",
-            "context_minutes": self.minutes.value(),
-            "notes_folder": self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"],
-            "playbook": self.playbook.toPlainText(),
-        })
+        self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
         save_settings(self.store.settings)
         self.accept()
 
@@ -712,12 +484,10 @@ def tray_icon(listening):
     painter.setBrush(QColor("#ff3b30") if listening else QColor(140, 140, 140))
     painter.drawEllipse(6, 6, 32, 32)
     painter.setBrush(QColor(255, 255, 255, 230))
-    # a small waveform glyph
-    for i, h in enumerate((6, 12, 20, 12, 6)):
+    for i, h in enumerate((6, 12, 20, 12, 6)):   # a small waveform glyph
         painter.drawRoundedRect(12 + i * 5, 22 - h // 2, 3, h, 1.5, 1.5)
     painter.end()
-    icon = QIcon(pixmap)
-    return icon
+    return QIcon(pixmap)
 
 
 # --- platform glue -----------------------------------------------------------------------------------
@@ -749,7 +519,6 @@ def main():
     app.setApplicationName("Heard")
     app.setQuitOnLastWindowClosed(False)
     store = Store()
-    settings_dialog = {"open": None}
 
     def toggle_visible():
         if overlay.isVisible():
@@ -759,12 +528,10 @@ def main():
             overlay.raise_()
 
     def open_settings():
-        dialog = SettingsDialog(store)
-        settings_dialog["open"] = dialog
         if IS_MAC:
             from AppKit import NSApp
             NSApp.activateIgnoringOtherApps_(True)
-        dialog.exec()
+        SettingsDialog(store).exec()
 
     overlay = Overlay(store, hide_me=lambda: overlay.hide(), open_settings=open_settings)
     overlay.place_at_top()
@@ -775,7 +542,6 @@ def main():
     menu = QMenu()
     menu.addAction(QAction(f"Show / hide overlay\t{MOD}H", menu, triggered=toggle_visible))
     menu.addAction(QAction(f"Listening on / off\t{MOD}L", menu, triggered=store.toggle_listening))
-    menu.addAction(QAction(f"Assist\t{MOD}↩", menu, triggered=lambda: (overlay.show(), store.assist())))
     menu.addSeparator()
     menu.addAction(QAction("Open notes folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
     menu.addAction(QAction("Open transcript folder", menu, triggered=lambda: open_folder(DATA_DIRECTORY)))
@@ -788,10 +554,7 @@ def main():
     store.changed.connect(lambda: tray.setIcon(tray_icon(store.listening)))
 
     def on_hotkey(key_id):
-        if key_id == HotKeys.ASSIST:
-            overlay.show()
-            store.assist()
-        elif key_id == HotKeys.TOGGLE_VISIBLE:
+        if key_id == HotKeys.TOGGLE_VISIBLE:
             toggle_visible()
         elif key_id == HotKeys.TOGGLE_LISTENING:
             store.toggle_listening()
