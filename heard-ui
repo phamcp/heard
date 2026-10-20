@@ -378,13 +378,30 @@ def _claude_model(key, workspace=""):
     return next((i for i in ids if "sonnet" in i), ids[0] if ids else "")
 
 
+def _claude_open(payload, key, workspace, timeout):
+    """POST /v1/messages and return the open response. Asks the model to answer without thinking first
+    ({"type": "between_tools"}): otherwise a newer model can spend the whole token budget thinking and send no
+    text at all. Models that don't know that option get the request again without it. No temperature: newer
+    models reject it."""
+    import urllib.error
+    import urllib.request
+    for attempt in (dict(payload, thinking={"type": "between_tools"}), payload):
+        request = urllib.request.Request("https://api.anthropic.com/v1/messages",
+                                         data=json.dumps(attempt).encode("utf-8"),
+                                         headers={"content-type": "application/json", **_claude_headers(key, workspace)})
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if attempt is payload or error.code != 400 or "thinking" not in claude_error_message(error):
+                raise
+
+
 def _ask_claude(system, user, workspace=""):
     key = _claude_key()
-    reply = _http_json("https://api.anthropic.com/v1/messages", {
-        "model": _claude_model(key, workspace), "max_tokens": 2000, "temperature": 0.2,
-        "system": system + "\nReply with only the JSON object.",
-        "messages": [{"role": "user", "content": user}],
-    }, headers=_claude_headers(key, workspace), timeout=300)
+    with _claude_open({"model": _claude_model(key, workspace), "max_tokens": 4000,
+                       "system": system + "\nReply with only the JSON object.",
+                       "messages": [{"role": "user", "content": user}]}, key, workspace, timeout=300) as response:
+        reply = json.loads(response.read().decode("utf-8"))
     text = "".join(block.get("text", "") for block in reply.get("content", []))
     return json.loads(text[text.find("{"):text.rfind("}") + 1])
 
@@ -481,28 +498,47 @@ def describe_summary_error(error, settings):
 # The Ask tab sends the transcript so far plus a question to the same model as the summaries (Settings), and
 # streams the answer back. Earlier questions and answers in the same call ride along so follow-ups work.
 
-COACH_PROMPT = """You are a real-time coach for a live call, read in a small overlay while the call goes on.
-The transcript is automatic, so expect misheard words. "me" is the person asking you; "them" is everyone else
-on the call. Coach like an experienced sales leader sitting next to them, so they can act in the next few seconds:
-- Lead with the answer. Keep it under 80 words unless asked for more.
-- When they should say something, give the exact line to say, in double quotes. Make it specific to what was
-  just said: answer the concern with substance or ask the sharp question that moves the call forward. Never
-  settle for generic advice like "acknowledge their concerns".
-- At most 3 short bullets, only if they add something. Don't read the transcript back to them.
-- No headings, no preamble, no recap of the question.
-- Use only what is in the transcript for facts about the call; say so if the transcript doesn't cover it.
-- Never put a number, timeline, price, customer name or product claim in a suggested line unless the transcript
-  says it. Where one is needed, leave a placeholder like [X weeks] or turn it into a question for them.
-Do not use em dashes."""
+COACH_PROMPT = """You coach the person labeled "me" during a live call. They glance at your reply while talking.
+Reply with only the exact words they should say next: one or two short sentences, at most 30 words, in their
+voice, ready to read out loud. Never explain why or what it achieves, not even in a closing sentence. No labels
+like "Say:", no quotation marks, no bullets, no preamble.
+Make it specific to what was just said: answer the concern with substance or ask the sharp question that moves
+the call forward.
+If the question asks for something other than what to say (what they asked, a recap), answer in one or two short
+plain lines, still with no explanation.
+The transcript is automatic, so expect misheard words. "them" is everyone else on the call. Use only what is in
+the transcript for facts about the call. Never put a number, timeline, price, customer name or product claim in
+what they say unless the transcript says it; where one is needed, write a placeholder like [X weeks] or make it a
+question instead. Do not use em dashes."""
 COACH_TRANSCRIPT_CHARS = 30000   # the newest part of a long call, about 8k tokens
-QUICK_QUESTIONS = (("Say next?", "What should I say next?"), ("Their question?", "What did they just ask?"),
-                   ("Objections?", "Any objections I missed?"), ("Recap", "Summarize the call so far"))   # (button, question)
+
+
+def speakable(text):
+    """Just the words to say: drop labels ("Say:"), bullets, bold markers and wrapping quotes the model may add
+    anyway. Safe on a half-streamed answer and on notes in _italics_."""
+    text = text.replace(" — ", ", ").replace("—", ", ").replace("**", "")
+    lines = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        line = re.sub(r"^[-*•]\s+", "", line)
+        line = re.sub(r"^(?:you (?:could|can|should|might) say|say|try|suggested line|answer)\s*:\s*", "", line,
+                      flags=re.IGNORECASE)
+        line = re.sub(r'^[“"]+', "", line)
+        line = re.sub(r'[”"]+$', "", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+QUICK_QUESTIONS = (("Say next?", "What should I say next?"),
+                   ("Their question?", "Answer the last question they asked me: what should I say?"),
+                   ("Objections?", "Handle the objection they raised: what should I say?"),
+                   ("Recap", "Recap the call so far in two short lines"))   # (button, question)
 
 
 def _stream_local(model, system, messages, on_text):
     import urllib.request
     payload = {"model": model, "stream": True, "keep_alive": "30m",   # stays loaded through the call
-               "options": {"temperature": 0.3, "num_ctx": 16384},
+               "options": {"temperature": 0.3, "num_ctx": 16384, "num_predict": 160},   # a line to say, not an essay
                "messages": [{"role": "system", "content": system}] + messages}
     request = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=json.dumps(payload).encode("utf-8"),
                                      headers={"content-type": "application/json"})
@@ -517,13 +553,10 @@ def _stream_local(model, system, messages, on_text):
 
 
 def _stream_claude(system, messages, on_text, workspace=""):
-    import urllib.request
     key = _claude_key()
-    payload = {"model": _claude_model(key, workspace), "max_tokens": 800, "temperature": 0.3, "stream": True,
-               "system": system, "messages": messages}
-    request = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode("utf-8"),
-                                     headers={"content-type": "application/json", **_claude_headers(key, workspace)})
-    with urllib.request.urlopen(request, timeout=300) as response:
+    payload = {"model": _claude_model(key, workspace), "max_tokens": 1000, "stream": True,   # the prompt keeps the
+               "system": system, "messages": messages}                                      # answer short
+    with _claude_open(payload, key, workspace, timeout=300) as response:
         for raw in response:
             line = raw.decode("utf-8").strip()
             if line.startswith("data:"):
@@ -561,6 +594,7 @@ class Store(QObject):
     def __init__(self):
         super().__init__()
         self.summarizing = set()      # log paths with a summary in progress
+        self.summary_info = {}        # path -> (started, engine name), for the Library's loading line
         self.summary_finished.connect(self._apply_summary)
         self.transcript = Transcript()
         self.settings = load_settings()
@@ -669,7 +703,9 @@ class Store(QObject):
         self.summarizing.add(path)
         settings = dict(self.settings)
         engine = "Claude" if settings.get("summarizer") == "claude" else settings.get("local_model")
+        self.summary_info[path] = (time.time(), engine)   # for the Library's loading line
         self.status_changed.emit(f"Summarizing the call with {engine}...")
+        self.logs_changed.emit()
 
         def work():
             try:
@@ -683,8 +719,10 @@ class Store(QObject):
     def _apply_summary(self, path, summary, error):
         """Back on the UI thread: rewrite the log with the summary on top and rename it after the meeting."""
         self.summarizing.discard(path)
+        self.summary_info.pop(path, None)
         if summary is None:
             self.status_changed.emit(f"Summary skipped: {error}")
+            self.logs_changed.emit()   # take the loading line down
             return
         old = Path(path)
         if not old.exists():
@@ -893,6 +931,7 @@ QListWidget::item:selected { background: rgba(255,255,255,0.16); color: #ffffff;
 QListWidget::item:hover { background: rgba(255,255,255,0.09); }
 QLabel#status { color: #9c9c9c; font-size: 10px; }
 QWidget#chat { background: rgba(255,255,255,0.05); border-radius: 10px; }
+QLabel#busy { color: #d0d0d0; background: rgba(255,255,255,0.07); border-radius: 8px; padding: 6px 10px; }
 QLabel#hint { color: #8a8a8a; }
 QScrollBar:vertical { background: transparent; width: 8px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,0.18); border-radius: 4px; min-height: 20px; }
@@ -1021,9 +1060,17 @@ class LogsPane(QWidget):
         tools.addWidget(self.summarize_button)
         tools.addStretch(1)
         tools.addWidget(self.delete_button)
+        # loading line above the log while the AI names and summarizes it
+        self.busy = QLabel("")
+        self.busy.setObjectName("busy")
+        self.busy.setVisible(False)
+        self.busy_timer = QTimer(self)
+        self.busy_timer.setInterval(400)
+        self.busy_timer.timeout.connect(self.update_busy)
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(6)
+        right.addWidget(self.busy)
         right.addWidget(self.view, 1)
         right.addLayout(tools)
         layout = QHBoxLayout()
@@ -1035,18 +1082,38 @@ class LogsPane(QWidget):
         store.logs_changed.connect(self.reload)
         self.reload()
 
+    def update_busy(self):
+        """'Naming and summarizing this call with gemma3:12b...  12 s' while the shown log is being summarized."""
+        path = self.current_path()
+        info = self.store.summary_info.get(path) if path in self.store.summarizing else None
+        if not info:
+            self.busy.setVisible(False)
+            self.busy_timer.stop()
+            return
+        started, engine = info
+        elapsed = time.time() - started
+        dots = "." * (1 + int(elapsed / 0.4) % 3)
+        self.busy.setText(f"Naming and summarizing this call with {engine}{dots:<3}   {int(elapsed)} s")
+        self.busy.setVisible(True)
+        if not self.busy_timer.isActive():
+            self.busy_timer.start()
+
     def reload(self):
         current = self.store.last_log_path or self.current_path()   # a just-written log wins over the old selection
         self.store.last_log_path = None
         self.list.clear()
         for path in self.store.logs():
             name = path.name[:-len(LOG_SUFFIX)]
-            item = QListWidgetItem(f"{name[:16]}\n{name[17:]}" if len(name) > 17 else name)   # date/time, then title
+            label = f"{name[:16]}\n{name[17:]}" if len(name) > 17 else name   # date/time, then title
+            if str(path) in self.store.summarizing:
+                label += "\nNaming and summarizing..."
+            item = QListWidgetItem(label)
             item.setData(Qt.UserRole, str(path))
             item.setToolTip(str(path))
             self.list.addItem(item)
         if self.list.count() == 0:
             self.view.setHtml('<p style="color:#8a8a8a">Nothing in the library yet. Stop recording files the current call here.</p>')
+            self.update_busy()
             return
         for index in range(self.list.count()):
             if current and self.list.item(index).data(Qt.UserRole) == current:
@@ -1059,6 +1126,7 @@ class LogsPane(QWidget):
         return item.data(Qt.UserRole) if item else None
 
     def show_log(self, item):
+        self.update_busy()
         if not item:
             return
         try:
@@ -1117,8 +1185,12 @@ class ChatPane(QWidget):
         self.pending = None    # [question, answer so far] while an answer streams
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
+        # Follow the newest text unless the reader scrolled up (same scheme as LivePane): setHtml() resets the
+        # scroll bar and the new length is only known after layout, so re-apply on every range change.
+        self.follow, self.position, self.updating = True, 0, False
         bar = self.view.verticalScrollBar()
-        bar.rangeChanged.connect(lambda _minimum, maximum: bar.setValue(maximum))   # always show the newest
+        bar.valueChanged.connect(self.on_scroll)
+        bar.rangeChanged.connect(self.on_range)
         # a side panel next to the live transcript: a light card, quick questions in a 2 x 2 grid
         self.setObjectName("chat")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -1161,6 +1233,7 @@ class ChatPane(QWidget):
             return
         self.input.clear()
         self.pending = [question, ""]
+        self.follow = True   # a new question: show its answer as it arrives
         transcript, history = as_text(self.store.lines), list(self.history)
 
         def work():
@@ -1184,8 +1257,7 @@ class ChatPane(QWidget):
             return
         question, answer = self.pending
         self.pending = None
-        answer = re.sub(r'([“”"])[“”"]+', r"\1", answer.strip())   # doubled quote marks
-        answer = answer.replace(" — ", ", ").replace("—", ", ")
+        answer = speakable(answer)
         if error:
             self.shown.append((question, (answer + "\n\n" if answer else "") + f"_Could not answer: {error}_"))
         else:
@@ -1198,16 +1270,43 @@ class ChatPane(QWidget):
             self.history, self.shown = [], []
             self.render()
 
+    def on_scroll(self, value):
+        if not self.updating:
+            self.follow = value >= self.view.verticalScrollBar().maximum() - 4
+            self.position = value
+
+    def on_range(self, _minimum, maximum):
+        was_updating = self.updating   # this also fires from inside setHtml(): keep render()'s guard up
+        self.updating = True
+        self.view.verticalScrollBar().setValue(maximum if self.follow else min(self.position, maximum))
+        self.updating = was_updating
+
     def render(self):
+        """Your question small and grey, the line to say bold and bright; notes (errors) in grey italics."""
         turns = self.shown + ([tuple(self.pending)] if self.pending else [])
         if not turns:
-            self.view.setMarkdown("What to say next, what they asked, how to handle an objection. "
-                                  "Answers use the live transcript.")
-            return
-        parts = []
-        for question, answer in turns:
-            parts.append(f"**You:** {question}\n\n{answer.replace(chr(0x2014), ', ') or '_thinking..._'}")
-        self.view.setMarkdown("\n\n".join(parts))
+            html = ('<p style="color:#8a8a8a">What to say next, their question, an objection, a recap. '
+                    'Answers use the live transcript.</p>')
+        else:
+            parts = []
+            for question, answer in turns:
+                parts.append(f'<p style="color:#8a8a8a;font-size:11px;margin:12px 0 3px 0">{escape(question)}</p>')
+                lines = [line for line in speakable(answer).splitlines() if line.strip()]
+                if not lines:
+                    parts.append('<p style="color:#8a8a8a;margin:0">...</p>')
+                for line in lines:
+                    if line.startswith("_") and line.endswith("_"):
+                        parts.append(f'<p style="color:#8a8a8a;font-style:italic;margin:2px 0">'
+                                     f'{escape(line.strip("_"))}</p>')
+                    else:
+                        parts.append(f'<p style="color:#ffffff;font-size:14px;font-weight:600;margin:2px 0">'
+                                     f'{escape(line)}</p>')
+            html = "".join(parts)
+        bar = self.view.verticalScrollBar()
+        self.updating = True
+        self.view.setHtml(html)
+        bar.setValue(bar.maximum() if self.follow else min(self.position, bar.maximum()))
+        self.updating = False
 
 
 class Overlay(QWidget):
