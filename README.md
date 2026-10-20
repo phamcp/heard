@@ -111,17 +111,19 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | Control | |
 |---|---|
 | **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | opens a session; amber while off |
-| **● Listening · Stop** (same key) | red, blinking, with the minutes so far; Stop ends the session and writes its transcript as a log |
-| **Live** tab | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
-| **Logs** tab | every session log (and every Save) in your logs folder (`~/Documents/heard`): read, Copy, Show in folder, Delete |
+| **● Listening · Stop** (same key) | red, blinking, with the minutes so far; Stop ends the session, writes its transcript as a log and clears the view |
+| transcript | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
+| **Logs** | toggles the log list: every log in your logs folder (`~/Documents/heard`) with its text, Copy log, Show in folder, Delete |
 | **Copy** | the whole transcript shown, as text, to the clipboard |
-| **Save** | what is shown as a log, without stopping |
+| **Log** | writes what is shown to a log and clears the view, without stopping |
 | ⚙ | the logs folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
-A session also closes, with its log, when the daemon pauses itself after the time limit or is restarted, and on
-the next overlay start if the overlay itself was quit mid-session. Logs are kept until you delete them; the
-rolling transcript database behind them still expires after 3 days.
+Each log is titled from the transcript's own words (its most prominent phrases, e.g. "staging rollout, IAM
+change, platform team"): keyword extraction done locally, not a summary. The file name is the start time plus
+that title. A session also closes, with its log, when the daemon pauses itself after the time limit or is
+restarted, and on the next overlay start if the overlay itself was quit mid-session. Logs are kept until you
+delete them; the rolling transcript database behind them still expires after 3 days.
 
 ### The command line
 
