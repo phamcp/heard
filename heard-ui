@@ -33,7 +33,7 @@ from pathlib import Path
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
+                               QGridLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
                                QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 IS_MAC = sys.platform == "darwin"
@@ -50,7 +50,8 @@ SESSION_PATH = DATA_DIRECTORY / "session.json"   # the current call's start time
 SHOW_REQUEST = DATA_DIRECTORY / "show-request"   # a second launch (desktop shortcut) asks the running overlay to show
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
-MINI_WIDTH, MINI_HEIGHT = 112, 38   # collapsed: logo, play/pause, stop
+MINI_WIDTH, MINI_HEIGHT = 144, 38   # collapsed: logo, play/pause, stop, ask
+MINI_CHAT_WIDTH, MINI_CHAT_HEIGHT = 360, 400   # collapsed with Ask open: the chat alone under the pill
 LOG_SUFFIX = " heard.md"
 
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0,   # view_since: last Stop recording
@@ -378,7 +379,8 @@ on the call. Coach like an experienced sales leader sitting next to them, so the
   says it. Where one is needed, leave a placeholder like [X weeks] or turn it into a question for them.
 Do not use em dashes."""
 COACH_TRANSCRIPT_CHARS = 30000   # the newest part of a long call, about 8k tokens
-QUICK_QUESTIONS = ("What should I say next?", "What did they just ask?", "Any objections I missed?", "Summarize so far")
+QUICK_QUESTIONS = (("Say next?", "What should I say next?"), ("Their question?", "What did they just ask?"),
+                   ("Objections?", "Any objections I missed?"), ("Recap", "Summarize the call so far"))   # (button, question)
 
 
 def _stream_local(model, system, messages, on_text):
@@ -765,6 +767,7 @@ QPushButton#stop { background: rgba(224,58,48,0.22); color: #ffb4ae; }
 QPushButton#stop:hover { background: rgba(224,58,48,0.4); color: #ffffff; }
 QPushButton#mini { background: rgba(255,255,255,0.09); padding: 0; border-radius: 13px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; }
 QPushButton#mini:hover { background: rgba(255,255,255,0.2); }
+QPushButton#mini[active="true"] { background: rgba(255,255,255,0.22); }
 QPushButton#logo { background: transparent; padding: 0; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; }
 QPushButton#tab[active="true"] { background: rgba(255,255,255,0.14); color: #ffffff; font-weight: 600; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
@@ -774,6 +777,7 @@ QListWidget::item { padding: 5px 6px; border-radius: 6px; }
 QListWidget::item:selected { background: rgba(255,255,255,0.16); color: #ffffff; }
 QListWidget::item:hover { background: rgba(255,255,255,0.09); }
 QLabel#status { color: #9c9c9c; font-size: 10px; }
+QWidget#chat { background: rgba(255,255,255,0.05); border-radius: 10px; }
 QLabel#hint { color: #8a8a8a; }
 QScrollBar:vertical { background: transparent; width: 8px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,0.18); border-radius: 4px; min-height: 20px; }
@@ -1000,19 +1004,28 @@ class ChatPane(QWidget):
         self.view.setOpenExternalLinks(True)
         bar = self.view.verticalScrollBar()
         bar.rangeChanged.connect(lambda _minimum, maximum: bar.setValue(maximum))   # always show the newest
-        chips = QHBoxLayout()
+        # a side panel next to the live transcript: a light card, quick questions in a 2 x 2 grid
+        self.setObjectName("chat")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Ask about this call")
+        title.setObjectName("hint")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(pill("Clear", self.clear, "icon", "Clear this conversation"))
+        chips = QGridLayout()
         chips.setContentsMargins(0, 0, 0, 0)
         chips.setSpacing(6)
-        for question in QUICK_QUESTIONS:
-            chips.addWidget(pill(question, lambda _checked=False, q=question: self.ask(q), "tab"))
-        chips.addStretch(1)
-        chips.addWidget(pill("Clear", self.clear, "icon", "Clear this conversation"))
+        for number, (label, question) in enumerate(QUICK_QUESTIONS):
+            chips.addWidget(pill(label, lambda _checked=False, q=question: self.ask(q), "tab", question), number // 2, number % 2)
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Ask about this call...  (Enter)")
+        self.input.setPlaceholderText("Ask...  (Enter)")
         self.input.returnPressed.connect(lambda: self.ask(self.input.text()))
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(10, 6, 10, 10)
         layout.setSpacing(6)
+        layout.addLayout(header)
         layout.addWidget(self.view, 1)
         layout.addLayout(chips)
         layout.addWidget(self.input)
@@ -1073,8 +1086,8 @@ class ChatPane(QWidget):
     def render(self):
         turns = self.shown + ([tuple(self.pending)] if self.pending else [])
         if not turns:
-            self.view.setMarkdown("Ask anything about the call so far: what to say next, what they asked, how to "
-                                  "handle an objection. Answers use the live transcript and the AI chosen in Settings.")
+            self.view.setMarkdown("What to say next, what they asked, how to handle an objection. "
+                                  "Answers use the live transcript.")
             return
         parts = []
         for question, answer in turns:
@@ -1096,7 +1109,7 @@ class Overlay(QWidget):
 
         self.switch = pill("", store.toggle_listening, "switch", f"Start / pause capturing ({MOD}L)")
         self.logs_tab = pill("Library", self.toggle_logs, "tab", "Show the library of logged calls; click again for the live transcript")
-        self.ask_tab = pill("Ask", self.toggle_ask, "tab", "Ask AI about this call; click again for the live transcript")
+        self.ask_tab = pill("Ask", self.toggle_ask, "tab", "Open or close Ask beside the live transcript")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search…  (clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1132,25 +1145,45 @@ class Overlay(QWidget):
         self.mini_switch = pill("", store.toggle_listening, "mini", f"Start / pause capturing ({MOD}L)")
         self.mini_stop = pill("", store.stop_recording, "mini", "Stop recording: file this call in the library and pause")
         self.mini_stop.setIcon(glyph_icon("stop"))
+        self.mini_ask = pill("", self.toggle_mini_chat, "mini", "Ask about this call (chat only)")
+        self.mini_ask.setIcon(glyph_icon("chat"))
         for button in (self.mini_switch, self.mini_stop):
             button.setIconSize(QSize(12, 12))
+        self.mini_ask.setIconSize(QSize(14, 14))
         mini = QHBoxLayout()
         mini.setContentsMargins(5, 0, 8, 0)
         mini.setSpacing(6)
         mini.addWidget(self.logo_button)
         mini.addWidget(self.mini_switch)
         mini.addWidget(self.mini_stop)
+        mini.addWidget(self.mini_ask)
+        mini.addStretch(1)
         self.mini_widget = QWidget()
         self.mini_widget.setLayout(mini)
         self.mini_widget.setFixedHeight(MINI_HEIGHT)
+        # collapsed with Ask open: the chat alone under the pill, no transcript
+        self.mini_chat_holder = QWidget()
+        holder = QVBoxLayout()
+        holder.setContentsMargins(8, 0, 8, 8)
+        self.mini_chat_holder.setLayout(holder)
+        self.ask_open = False    # Ask beside the transcript (expanded)
+        self.mini_chat = False   # Ask under the pill (collapsed)
 
         self.stack = QStackedWidget()
         self.live_pane = LivePane(store)
         self.logs_pane = LogsPane(store)
         self.chat_pane = ChatPane(store)
-        self.stack.addWidget(self.live_pane)
+        self.chat_pane.setVisible(False)
+        live_row = QHBoxLayout()   # the transcript, and Ask beside it when it's open
+        live_row.setContentsMargins(0, 0, 0, 0)
+        live_row.setSpacing(10)
+        live_row.addWidget(self.live_pane, 3)
+        live_row.addWidget(self.chat_pane, 2)
+        self.live_row = live_row
+        self.live_view = QWidget()
+        self.live_view.setLayout(live_row)
+        self.stack.addWidget(self.live_view)
         self.stack.addWidget(self.logs_pane)
-        self.stack.addWidget(self.chat_pane)
         self.status = QLabel("")
         self.status.setObjectName("status")
         self.status.setContentsMargins(2, 0, 2, 6)
@@ -1166,6 +1199,7 @@ class Overlay(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self.mini_widget)
+        root.addWidget(self.mini_chat_holder, 1)
         root.addWidget(bar_widget)
         root.addWidget(self.pane, 1)
         self.setLayout(root)
@@ -1218,18 +1252,49 @@ class Overlay(QWidget):
 
     def toggle_expanded(self):
         self.expanded = not self.expanded
+        if self.expanded and self.mini_chat:
+            self.ask_open = True   # keep the conversation on screen, now beside the transcript
         self.apply_size()
 
+    def toggle_mini_chat(self):
+        self.mini_chat = not self.mini_chat
+        self.apply_size()
+        if self.mini_chat:
+            self.activateWindow()   # the overlay doesn't take focus on its own; typing needs it
+            self.chat_pane.input.setFocus()
+
+    def place_chat(self, in_pill):
+        """One chat, two homes: beside the transcript (expanded) or alone under the pill (collapsed)."""
+        home = self.mini_chat_holder if in_pill else self.live_view
+        if self.chat_pane.parentWidget() is home:
+            return
+        (self.live_row if in_pill else self.mini_chat_holder.layout()).removeWidget(self.chat_pane)
+        if in_pill:
+            self.mini_chat_holder.layout().addWidget(self.chat_pane)
+        else:
+            self.live_row.addWidget(self.chat_pane, 2)
+
     def apply_size(self):
-        """Expanded: the full bar and pane. Collapsed: a small pill, kept centred where the bar was."""
+        """Expanded: the full bar and pane (Ask beside the transcript when open). Collapsed: a small pill, with
+        the chat alone under it when its Ask button is on. Kept centred where it was."""
         centre_x = self.geometry().center().x() if self.isVisible() else None
+        mini_chat = not self.expanded and self.mini_chat
+        self.place_chat(mini_chat)
         self.bar_widget.setVisible(self.expanded)
         self.pane.setVisible(self.expanded)
         self.mini_widget.setVisible(not self.expanded)
+        self.mini_chat_holder.setVisible(mini_chat)
+        self.chat_pane.setVisible(mini_chat or (self.expanded and self.ask_open))
+        if self.mini_ask.property("active") != ("true" if mini_chat else "false"):
+            self.mini_ask.setProperty("active", "true" if mini_chat else "false")
+            repolish(self.mini_ask)
         if self.expanded:
             self.setFixedSize(BAR_WIDTH, BAR_HEIGHT + PANE_HEIGHT)
+        elif mini_chat:
+            self.setFixedSize(MINI_CHAT_WIDTH, MINI_HEIGHT + MINI_CHAT_HEIGHT)
         else:
             self.setFixedSize(MINI_WIDTH, MINI_HEIGHT)
+        self.render_tabs()
         if centre_x is not None:
             screen = (self.screen() or QApplication.primaryScreen()).availableGeometry()
             x = min(max(centre_x - self.width() // 2, screen.left()), screen.right() - self.width())
@@ -1242,22 +1307,32 @@ class Overlay(QWidget):
 
     def show_tab(self, index, expand=True):
         self.stack.setCurrentIndex(index)
-        for tab, tab_index in ((self.logs_tab, 1), (self.ask_tab, 2)):
-            tab.setProperty("active", "true" if index == tab_index else "false")
-            repolish(tab)
         if index == 1:
             self.logs_pane.reload()
         if expand and not self.expanded:
             self.toggle_expanded()
-        if index == 2 and self.expanded:
-            self.activateWindow()   # the overlay doesn't take focus on its own; typing needs it
-            self.chat_pane.input.setFocus()
+        self.render_tabs()
+
+    def render_tabs(self):
+        library = self.stack.currentIndex() == 1
+        asking = not library and self.ask_open
+        for tab, active in ((self.logs_tab, library), (self.ask_tab, asking)):
+            if tab.property("active") != ("true" if active else "false"):
+                tab.setProperty("active", "true" if active else "false")
+                repolish(tab)
 
     def toggle_logs(self):
         self.show_tab(0 if self.stack.currentIndex() == 1 else 1)
 
     def toggle_ask(self):
-        self.show_tab(0 if self.stack.currentIndex() == 2 else 2)
+        """Open Ask beside the live transcript, or close it; from the Library it goes back to the transcript."""
+        opening = self.stack.currentIndex() == 1 or not self.ask_open
+        self.ask_open = opening
+        self.show_tab(0)
+        self.apply_size()
+        if opening and self.expanded:
+            self.activateWindow()   # the overlay doesn't take focus on its own; typing needs it
+            self.chat_pane.input.setFocus()
 
     # rendering
     def render_switch(self):
@@ -1378,6 +1453,14 @@ def glyph_icon(kind):
         painter.drawPolyline(QPolygon([QPoint(6, 6), QPoint(7, 21), QPoint(17, 21), QPoint(18, 6)]))
         painter.drawLine(QPoint(10, 10), QPoint(10, 17))
         painter.drawLine(QPoint(14, 10), QPoint(14, 17))
+    elif kind == "chat":   # outline speech bubble, same weight as the trash can
+        pen = QPen(QColor("#d0d0d0"))
+        pen.setWidthF(1.8)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(QRectF(3, 4, 18, 12), 4, 4)
+        painter.drawPolyline(QPolygon([QPoint(8, 16), QPoint(7, 21), QPoint(12, 16)]))
     elif kind == "play":
         painter.drawPolygon(QPolygon([QPoint(7, 4), QPoint(20, 12), QPoint(7, 20)]))
     elif kind == "pause":
@@ -1548,7 +1631,10 @@ def main():
             elif os.environ.get("HEARD_UI_TAB") == "mini":
                 overlay.toggle_expanded()
             elif os.environ.get("HEARD_UI_TAB") == "ask":
-                overlay.show_tab(2)
+                overlay.toggle_ask()
+            elif os.environ.get("HEARD_UI_TAB") == "minichat":
+                overlay.toggle_expanded()
+                overlay.toggle_mini_chat()
             overlay.grab().save(os.environ["HEARD_UI_SCREENSHOT"])
             app.quit()
         QTimer.singleShot(int(os.environ.get("HEARD_UI_SCREENSHOT_DELAY", "3000")), shoot)

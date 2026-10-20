@@ -133,7 +133,8 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
 | transcript | lines as they land, the sentence in progress dimmed; the search field filters the retained history as you type (word prefixes match; quotes and OR work too), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Summarize, Delete |
-| **Ask** | toggles a chat about the live call: type a question or tap a quick one (What should I say next?, What did they just ask?, Any objections I missed?, Summarize so far). Answers stream in from the same AI as the summaries, using the call's transcript; follow-ups remember the conversation, and Stop recording starts a new one |
+| **Ask** | opens or closes a chat about the live call beside the transcript, which stays on screen. Type a question or tap a quick one (Say next?, Their question?, Objections?, Recap). Answers stream in from the same AI as the summaries, using the call's transcript; follow-ups remember the conversation, and Stop recording starts a new one |
+| collapsed pill | **⌃** shrinks the overlay to a pill: logo (click to expand), play/pause, stop, and a chat button that opens the same chat alone under the pill, without the transcript |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
 | ⚙ | the library folder, the AI for summaries and Ask (local model, Claude API, or off), and hiding from screen sharing |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
