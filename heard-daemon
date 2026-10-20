@@ -23,11 +23,12 @@ Per platform, the capture is a child process that writes 16 kHz mono s16le PCM t
   Windows  this script in `tap` mode: a WASAPI loopback input for "them", the default microphone for "me"
 
 Utterances go into ~/.local/share/heard/heard.db (SQLite FTS5); `heard` searches them.
-Nothing leaves the machine. `heard pause` / `heard resume` toggle capture; rows older than
-HEARD_RETENTION_DAYS (default 7) are deleted hourly.
+Nothing leaves the machine. Capture is off until `heard resume` (or the overlay's Listening switch) turns it
+on, pauses itself after HEARD_MAX_LISTEN_MINUTES (default 180), and rows older than HEARD_RETENTION_DAYS
+(default 3) are deleted hourly.
 
 Environment overrides: HEARD_THEM_SOURCE, HEARD_ME_SOURCE, HEARD_MODEL, HEARD_CPU_MODEL, HEARD_CPU_THREADS,
-HEARD_RETENTION_DAYS.
+HEARD_RETENTION_DAYS, HEARD_MAX_LISTEN_MINUTES, HEARD_START_LISTENING (capture from boot instead of starting paused).
 """
 import ctypes
 import glob
@@ -64,6 +65,7 @@ DATA_DIRECTORY = Path.home() / ".local/share/heard"
 DATABASE_PATH = DATA_DIRECTORY / "heard.db"
 PAUSE_FLAG = DATA_DIRECTORY / "paused"
 LIVE_PATH = DATA_DIRECTORY / "live.json"   # in-progress (partial) text per speaker, for `heard -f`
+HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"   # touched every 2 s while the daemon runs (heard status, heard-ui)
 
 THEM_SOURCE = os.environ.get("HEARD_THEM_SOURCE", "")   # empty: follow the current default output
 ME_SOURCE = os.environ.get("HEARD_ME_SOURCE", "")       # empty: the default microphone
@@ -71,7 +73,8 @@ SOURCE_CHECK_SECONDS = 5.0 if IS_WINDOWS else 2.0       # the Windows check star
 MODEL_NAME = os.environ.get("HEARD_MODEL", "large-v3-turbo")
 CPU_MODEL_NAME = os.environ.get("HEARD_CPU_MODEL", "small.en")   # used when there is no usable GPU
 CPU_THREADS = int(os.environ.get("HEARD_CPU_THREADS", str(max(2, (os.cpu_count() or 12) // 2))))   # half the cores
-RETENTION_DAYS = float(os.environ.get("HEARD_RETENTION_DAYS", "7"))
+RETENTION_DAYS = float(os.environ.get("HEARD_RETENTION_DAYS", "3"))
+MAX_LISTEN_MINUTES = float(os.environ.get("HEARD_MAX_LISTEN_MINUTES", "180"))   # auto-pause: a forgotten switch is not a week of audio
 
 stopping = threading.Event()
 latest_partials = {}                 # speaker -> (started_at, audio so far); newest wins
@@ -222,6 +225,7 @@ def preload_cuda_libraries():
 
 def open_database():
     DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIRECTORY, 0o700)
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(
@@ -317,6 +321,7 @@ def load_model():
 def write_live(live):
     temporary = LIVE_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(live))
+    os.chmod(temporary, 0o600)
     os.replace(temporary, LIVE_PATH)
 
 
@@ -360,6 +365,30 @@ def clean_up(connection):
         connection.commit()
 
 
+def auto_pause():
+    """Pause by itself after MAX_LISTEN_MINUTES of continuous capture, so a switch left on does not
+    quietly transcribe the rest of the day. Turning Listening on again restarts the clock."""
+    listening_since = None
+    while not stopping.wait(10):
+        if PAUSE_FLAG.exists():
+            listening_since = None
+        elif listening_since is None:
+            listening_since = time.time()
+        elif time.time() - listening_since > MAX_LISTEN_MINUTES * 60:
+            PAUSE_FLAG.touch()
+            listening_since = None
+            log(f"paused automatically after {MAX_LISTEN_MINUTES:.0f} minutes of listening")
+
+
+def heartbeat():
+    while not stopping.is_set():
+        try:
+            HEARTBEAT_PATH.touch()
+        except OSError:
+            pass
+        stopping.wait(2)
+
+
 def exit_before_sleep():
     """Linux only. A CUDA context kept across suspend/resume faulted the GPU (NVIDIA Xid 31 → "reboot
     required"). So hold a logind delay lock, and when sleep is announced, exit: the lock is released
@@ -386,6 +415,11 @@ def main():
     if IS_WINDOWS and sys.argv[1:2] == ["tap"]:
         return windows_tap(sys.argv[2:])
     connection = open_database()
+    if os.environ.get("HEARD_START_LISTENING"):
+        PAUSE_FLAG.unlink(missing_ok=True)
+    else:   # conservative default: nothing is captured until `heard resume` or the overlay's Listening switch
+        PAUSE_FLAG.touch()
+        log("started paused: `heard resume` or the overlay's Listening switch turns capture on")
     chunks = queue.Queue(maxsize=200)
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     resolve_them = (lambda: THEM_SOURCE) if THEM_SOURCE else default_output_monitor
@@ -394,6 +428,8 @@ def main():
         threading.Thread(target=capture, args=("them", resolve_them, chunks), daemon=True),
         threading.Thread(target=capture, args=("me", resolve_me, chunks), daemon=True),
         threading.Thread(target=clean_up, args=(connection,), daemon=True),
+        threading.Thread(target=auto_pause, daemon=True),
+        threading.Thread(target=heartbeat, daemon=True),
     ]
     if IS_LINUX:
         workers.append(threading.Thread(target=exit_before_sleep, daemon=True))

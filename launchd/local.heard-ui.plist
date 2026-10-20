@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Starts the Heard overlay (menu bar icon + floating bar) at login. Installed by macos/install.sh. -->
+	<key>Label</key>
+	<string>local.heard-ui</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>exec uv run --script "$HOME/.local/bin/heard-ui"</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/heard-ui.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/heard-ui.log</string>
+</dict>
+</plist>

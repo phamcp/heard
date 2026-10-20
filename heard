@@ -22,6 +22,7 @@ DATA_DIRECTORY = Path.home() / ".local/share/heard"
 DATABASE_PATH = DATA_DIRECTORY / "heard.db"
 PAUSE_FLAG = DATA_DIRECTORY / "paused"
 LIVE_PATH = DATA_DIRECTORY / "live.json"
+HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"
 LIVE_MAX_AGE_SECONDS = 6
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -54,7 +55,12 @@ def main():
             PAUSE_FLAG.touch()
         elif command == "resume":
             PAUSE_FLAG.unlink(missing_ok=True)
-        print("heard is", "PAUSED" if PAUSE_FLAG.exists() else "capturing (if heard-daemon is running)")
+        try:
+            alive = time.time() - HEARTBEAT_PATH.stat().st_mtime < 8
+        except OSError:
+            alive = False
+        state = "PAUSED" if PAUSE_FLAG.exists() else "CAPTURING"
+        print("heard is", state if alive else f"{state}, but heard-daemon is not running")
         return 0
 
     if not DATABASE_PATH.exists():

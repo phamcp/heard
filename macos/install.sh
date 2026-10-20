@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build heard-tap, install heard, heard-daemon and heard-tap into ~/.local/bin, and start the
-# launchd user agent. Re-run after pulling changes. `macos/install.sh --no-agent` only installs.
+# Build heard-tap, install heard, heard-daemon, heard-ui and heard-tap into ~/.local/bin, and start the
+# two launchd user agents (daemon, overlay). Re-run after pulling changes. `--no-agent` only installs.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -21,19 +21,30 @@ swiftc -O -suppress-warnings -swift-version 5 -target "$(uname -m)-apple-macos14
     -o build/heard-tap macos/heard-tap.swift
 codesign --force --sign - build/heard-tap
 
-install -m 755 heard heard-daemon build/heard-tap "$HOME/.local/bin/"
-sed "s|__HOME__|$HOME|g" launchd/local.heard.plist > "$HOME/Library/LaunchAgents/local.heard.plist"
-echo "installed heard, heard-daemon and heard-tap in ~/.local/bin"
+install -m 755 heard heard-daemon heard-ui build/heard-tap "$HOME/.local/bin/"
+for agent in local.heard local.heard-ui; do
+    sed "s|__HOME__|$HOME|g" "launchd/$agent.plist" > "$HOME/Library/LaunchAgents/$agent.plist"
+done
+echo "installed heard, heard-daemon, heard-ui and heard-tap in ~/.local/bin"
 
 if [ "${1:-}" = "--no-agent" ]; then
     exit 0
 fi
-launchctl bootout "gui/$(id -u)/local.heard" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.heard.plist"
+for agent in local.heard local.heard-ui; do
+    launchctl bootout "gui/$(id -u)/$agent" 2>/dev/null || true
+    for attempt in 1 2 3 4 5; do   # right after a bootout, launchd can still be tearing the old job down
+        sleep 1
+        if launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$agent.plist" 2>/dev/null; then
+            break
+        fi
+        [ "$attempt" = 5 ] && { echo "could not start $agent; try: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$agent.plist" >&2; exit 1; }
+    done
+done
 cat <<EOF
-heard is running as a launchd agent (local.heard).
-  log:       tail -f ~/Library/Logs/heard.log   (the first start downloads the model)
+heard is running: the daemon (local.heard, started paused) and the overlay (local.heard-ui).
+  logs:      ~/Library/Logs/heard.log  ~/Library/Logs/heard-ui.log   (the first start downloads the model)
   restart:   launchctl kickstart -k gui/$(id -u)/local.heard
-  uninstall: launchctl bootout gui/$(id -u)/local.heard
+  uninstall: launchctl bootout gui/$(id -u)/local.heard; launchctl bootout gui/$(id -u)/local.heard-ui
+Nothing is captured until you turn Listening on (overlay, ⌘⇧L, or 'heard resume').
 Grant the two prompts (Microphone, System Audio Recording) when they appear.
 EOF
