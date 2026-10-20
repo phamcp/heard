@@ -22,8 +22,10 @@ function Stop-Heard {
         }
     }
     # Stopping a task ends only its launcher, so also end the wscript / cmd / uv / python processes behind it.
+    # Only those process types: a terminal or editor whose command line merely mentions these paths is left alone.
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+                       @("wscript.exe", "cmd.exe", "uv.exe", "python.exe", "pythonw.exe") -contains $_.Name.ToLower() -and
                        ($_.CommandLine -like "*\.local\bin\heard-daemon*" -or $_.CommandLine -like "*\.local\bin\heard-ui*") } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
