@@ -9,15 +9,15 @@
 """heard-ui: a light overlay for heard. macOS, Windows, Linux (one Qt script).
 
 A translucent, always-on-top bar that is excluded from screen sharing, with:
-  - Start listening / Stop: capture happens only in between. Stop ends the session and writes its transcript
-    as a Markdown log in your notes folder (so does the daemon pausing by itself, or being restarted).
-  - the transcript as it lands (the sentence in progress dimmed), search, Copy; Log writes what is shown to a
-    log and clears the view (Log call). Each log gets a title made from the transcript's own most prominent phrases
-    (local keyword extraction; nothing is sent anywhere).
+  - Start listening / Pause: capture happens only in between. Pause just pauses; the transcript stays on screen.
+  - Stop recording: files the transcript shown in the library as a Markdown log, clears the view and pauses.
+    Each log gets a title made from the transcript's own most prominent phrases (local keyword extraction;
+    nothing is sent anywhere).
+  - the transcript as it lands (the sentence in progress dimmed), search, Copy
   - Library: every logged call, with its text, Copy and Show in folder
   - a tray / menu bar icon that shows whether capture is on
 
-Global hotkeys: ⌘⇧H show/hide, ⌘⇧L start/stop (Ctrl+Shift on Windows). None on Linux.
+Global hotkeys: ⌘⇧H show/hide, ⌘⇧L start/pause (Ctrl+Shift on Windows). None on Linux.
 Everything reads ~/.local/share/heard (heard.db, live.json, paused, daemon.alive); nothing leaves the machine.
 """
 import ctypes
@@ -46,7 +46,7 @@ PAUSE_FLAG = DATA_DIRECTORY / "paused"
 LIVE_PATH = DATA_DIRECTORY / "live.json"
 HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"
 CONFIG_PATH = DATA_DIRECTORY / "ui-config.json"
-SESSION_PATH = DATA_DIRECTORY / "session.json"   # the open session's start time, so a log is written even after a crash
+SESSION_PATH = DATA_DIRECTORY / "session.json"   # the current call's start time, kept across overlay restarts
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
 LOG_SUFFIX = " heard.md"
@@ -186,6 +186,8 @@ class Store(QObject):
     changed = Signal()          # transcript / live / listening / daemon state
     logs_changed = Signal()
     status_changed = Signal(str)
+    listening_started = Signal()
+    recording_stopped = Signal()
 
     def __init__(self):
         super().__init__()
@@ -196,8 +198,9 @@ class Store(QObject):
         self.listening = False
         self.daemon_running = False
         self.search_results = None
-        self.newest = time.time() - 3 * 3600
         self.session_start = self._load_session()
+        # show the current call from its start, or the last three hours
+        self.newest = (self.session_start - 1) if self.session_start else time.time() - 3 * 3600
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(500)
@@ -222,32 +225,40 @@ class Store(QObject):
             os.chmod(SESSION_PATH, 0o600)
         PAUSE_FLAG.unlink(missing_ok=True)
         self.refresh()
+        self.listening_started.emit()
 
-    def stop_listening(self):
+    def pause_listening(self):
+        """Pause capture only: the transcript stays on screen and the call stays open."""
         DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
         PAUSE_FLAG.touch()
-        self.finish_session()
         self.refresh()
 
     def toggle_listening(self):
         if self.listening:
-            self.stop_listening()
+            self.pause_listening()
         else:
             self.start_listening()
 
-    def finish_session(self):
-        """Write the open session's transcript as a log and close the session."""
-        if self.session_start is None:
-            return
-        start, end = self.session_start, time.time()
-        lines = self.transcript.since(start - 1, limit=100000)
-        minutes = max(1, int(round((end - start) / 60)))
-        detail = (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(start))}–{time.strftime('%H:%M', time.localtime(end))}, "
-                  f"{minutes} min, {len(lines)} lines")
-        self.write_log(start, lines, detail, "Stopped")
+    def stop_recording(self):
+        """File the transcript shown in the library, clear the view, pause, and close the call."""
+        lines = self.shown_lines()
+        if lines:
+            started = self.session_start or lines[0][3]
+            ended = max(lines[-1][3], time.time() if self.listening else lines[-1][3])
+            minutes = max(1, int(round((ended - started) / 60)))
+            detail = (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}–"
+                      f"{time.strftime('%H:%M', time.localtime(ended))}, {minutes} min, {len(lines)} lines")
+            self.write_log(started, lines, detail, "Recording stopped")
+        else:
+            self.status_changed.emit("Nothing to file; paused")
+        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        PAUSE_FLAG.touch()
         self.session_start = None
         SESSION_PATH.unlink(missing_ok=True)
         self.clear_view()
+        self.refresh()
+        if lines:
+            self.recording_stopped.emit()
 
     def write_log(self, started, lines, detail, verb):
         """A Markdown log titled from the transcript's own words, filed by start time."""
@@ -263,13 +274,10 @@ class Store(QObject):
         self.logs_changed.emit()
 
     def clear_view(self):
-        """Empty the live view (the log keeps the text); an open session continues from now."""
+        """Empty the live view; the log keeps the text."""
         self.lines = []
         self.search_results = None
         self.newest = time.time()
-        if self.session_start is not None:
-            self.session_start = self.newest
-            SESSION_PATH.write_text(json.dumps({"started_at": self.session_start}))
         self.changed.emit()
 
     def log_folder(self):
@@ -295,12 +303,7 @@ class Store(QObject):
             self.daemon_running = time.time() - HEARTBEAT_PATH.stat().st_mtime < 8
         except OSError:
             self.daemon_running = False
-        listening = self.daemon_running and not PAUSE_FLAG.exists()
-        if self.listening and not listening and self.session_start is not None:
-            self.finish_session()   # the daemon paused itself (time limit) or was restarted
-        if not listening and self.session_start is not None and not self.listening:
-            self.finish_session()   # a session left open by an earlier run (crash, reboot)
-        self.listening = listening
+        self.listening = self.daemon_running and not PAUSE_FLAG.exists()
         live = []
         try:
             now = time.time()
@@ -325,17 +328,6 @@ class Store(QObject):
         lines = self.shown_lines()
         QApplication.clipboard().setText(as_text(lines))
         self.status_changed.emit(f"Copied {len(lines)} lines to the clipboard")
-
-    def log_and_clear(self):
-        lines = self.shown_lines()
-        if not lines:
-            self.status_changed.emit("Nothing to log yet")
-            return
-        started = lines[0][3]
-        detail = (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}–"
-                  f"{time.strftime('%H:%M', time.localtime(lines[-1][3]))}, {len(lines)} lines")
-        self.write_log(started, lines, detail, "Logged")
-        self.clear_view()
 
 
 def reveal(path):
@@ -445,6 +437,8 @@ QPushButton#switch[state="listening"] { background: #e03a30; color: #ffffff; }
 QPushButton#switch[state="listening"]:hover { background: #f04c42; }
 QPushButton#switch[state="off"] { background: rgba(255,255,255,0.09); color: #8a8a8a; }
 QPushButton#tab { background: rgba(255,255,255,0.09); color: #d0d0d0; padding: 5px 11px; }
+QPushButton#stop { background: rgba(224,58,48,0.22); color: #ffb4ae; }
+QPushButton#stop:hover { background: rgba(224,58,48,0.4); color: #ffffff; }
 QPushButton#tab[active="true"] { background: rgba(255,255,255,0.14); color: #ffffff; font-weight: 600; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
 QTextBrowser { background: transparent; border: none; }
@@ -500,8 +494,8 @@ class LivePane(QWidget):
             elif store.listening:
                 parts.append('<p style="color:#8a8a8a">Listening. Lines appear a few seconds after someone speaks.</p>')
             else:
-                parts.append('<p style="color:#8a8a8a">Not listening. Press Start listening before a call; Stop ends it '
-                             'and files it in the Library.</p>')
+                parts.append('<p style="color:#8a8a8a">Not listening. Start listening before a call, Pause any time; '
+                             'Stop recording files the call in the Library and clears this view.</p>')
         for _, speaker, text, started in shown:
             color = "#5aa0ff" if speaker == "me" else "#f0a44a"
             parts.append(f'<div style="margin:0 0 3px 0"><span style="color:#6f6f6f;font-family:Menlo,Consolas,monospace;'
@@ -565,7 +559,7 @@ class LogsPane(QWidget):
             item.setToolTip(str(path))
             self.list.addItem(item)
         if self.list.count() == 0:
-            self.view.setHtml('<p style="color:#8a8a8a">Nothing in the library yet. Each Stop (and each Log call) files one here.</p>')
+            self.view.setHtml('<p style="color:#8a8a8a">Nothing in the library yet. Stop recording files the current call here.</p>')
             return
         for index in range(self.list.count()):
             if current and self.list.item(index).data(Qt.UserRole) == current:
@@ -629,7 +623,7 @@ class Overlay(QWidget):
         self.drag_offset = None
         self.blink_on = True
 
-        self.switch = pill("", store.toggle_listening, "switch", f"Start / stop capturing ({MOD}L)")
+        self.switch = pill("", store.toggle_listening, "switch", f"Start / pause capturing ({MOD}L)")
         self.logs_tab = pill("Library", self.toggle_logs, "tab", "Show the library of logged calls; click again for the live transcript")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search…  (Enter; clear to go back live)")
@@ -637,7 +631,8 @@ class Overlay(QWidget):
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.search.textChanged.connect(lambda text: store.search("") if not text else None)
         self.copy_button = pill("Copy", store.copy_transcript, tooltip="Copy the whole transcript shown")
-        self.log_button = pill("Log call", store.log_and_clear, tooltip="File what is shown in the library and clear the view")
+        self.stop_button = pill("■  Stop recording", store.stop_recording, "stop",
+                                "File this call in the library, clear the view and pause")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
         self.settings_button = pill("⚙", open_settings, "icon", "Settings")
         self.hide_button = pill("✕", hide_me, "icon", f"Hide ({MOD}H)")
@@ -647,7 +642,7 @@ class Overlay(QWidget):
         bar.setSpacing(8)
         bar.addWidget(self.switch)
         bar.addWidget(self.logs_tab)
-        for widget in (self.search, self.copy_button, self.log_button, self.expand_button,
+        for widget in (self.search, self.copy_button, self.stop_button, self.expand_button,
                        self.settings_button, self.hide_button):
             bar.addWidget(widget)
         bar_widget = QWidget()
@@ -680,6 +675,8 @@ class Overlay(QWidget):
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=hide_me)
         store.changed.connect(self.render_switch)
         store.status_changed.connect(self.status.setText)
+        store.listening_started.connect(lambda: self.show_tab(0))
+        store.recording_stopped.connect(lambda: self.show_tab(1))
         self.blink = QTimer(self)
         self.blink.timeout.connect(self.toggle_blink)
         self.blink.start(700)
@@ -752,7 +749,7 @@ class Overlay(QWidget):
         elif store.listening:
             minutes = int((time.time() - (store.session_start or time.time())) / 60)
             dot = "●" if self.blink_on else "○"
-            state, label = "listening", f"{dot}  Listening · {minutes} min  ·  Stop" if minutes else f"{dot}  Listening  ·  Stop"
+            state, label = "listening", f"{dot}  Listening · {minutes} min  ·  Pause" if minutes else f"{dot}  Listening  ·  Pause"
         else:
             state, label = "paused", "▶  Start listening"
         self.switch.setText(f"{label}   {MOD}L")
@@ -779,7 +776,7 @@ class SettingsDialog(QDialog):
         folder_row.addWidget(self.folder)
         folder_row.addWidget(browse)
         form = QFormLayout()
-        form.addRow("Library folder (Stop and Log call write here)", folder_row)
+        form.addRow("Library folder (Stop recording writes here)", folder_row)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
                       "the machine.")
@@ -873,7 +870,8 @@ def main():
     tray = QSystemTrayIcon(tray_icon(store.listening))
     menu = QMenu()
     menu.addAction(QAction(f"Show / hide overlay\t{MOD}H", menu, triggered=toggle_visible))
-    menu.addAction(QAction(f"Start / stop listening\t{MOD}L", menu, triggered=store.toggle_listening))
+    menu.addAction(QAction(f"Start / pause listening\t{MOD}L", menu, triggered=store.toggle_listening))
+    menu.addAction(QAction("Stop recording (file in library)", menu, triggered=store.stop_recording))
     menu.addSeparator()
     menu.addAction(QAction("Library", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
     menu.addAction(QAction("Open library folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))

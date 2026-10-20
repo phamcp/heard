@@ -13,8 +13,8 @@ $ heard -f          # follow live, with an in-progress line for whoever is talki
 ```
 
 Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from screen sharing. Start listening
-before a call, Stop after it: each session becomes a Markdown log you can read, copy and search later in the
-overlay's Library.
+before a call, Stop recording after it: each call becomes a titled Markdown log you can read, copy and search
+later in the overlay's Library.
 
 - **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records the system's default output, not
   a particular app.
@@ -110,20 +110,20 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 
 | Control | |
 |---|---|
-| **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | opens a session; amber while off |
-| **● Listening · Stop** (same key) | red, blinking, with the minutes so far; Stop ends the session, writes its transcript as a log and clears the view |
+| **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | starts (or resumes) capturing and shows the transcript; amber while off |
+| **● Listening · Pause** (same key) | red, blinking, with the minutes since the call started; Pause only pauses, the transcript stays |
+| **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
 | transcript | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Delete |
 | **Copy** | the whole transcript shown, as text, to the clipboard |
-| **Log call** | files what is shown in the library and clears the view, without stopping |
 | ⚙ | the library folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
 Each log is titled from the transcript's own words (its most prominent phrases, e.g. "staging rollout, IAM
 change, platform team"): keyword extraction done locally, not a summary. The file name is the start time plus
-that title. A session also closes, with its log, when the daemon pauses itself after the time limit or is
-restarted, and on the next overlay start if the overlay itself was quit mid-session. Logs are kept until you
-delete them; the rolling transcript database behind them still expires after 3 days.
+that title. Nothing is filed or cleared until you press Stop recording: the daemon pausing itself after the
+time limit, or a restart, just pauses. Logs are kept until you delete them; the rolling transcript database
+behind the live view still expires after 3 days.
 
 ### The command line
 
