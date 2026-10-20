@@ -4,29 +4,38 @@
 # dependencies = [
 #   "faster-whisper>=1.1",
 #   "numpy",
-#   "nvidia-cublas-cu12",
-#   "nvidia-cudnn-cu12>=9,<10",
+#   "nvidia-cublas-cu12; sys_platform != 'darwin'",
+#   "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+#   "sounddevice>=0.5; sys_platform == 'win32'",
 # ]
 # ///
 """heard-daemon: local, real-time transcript of what you say and what you hear.
 
-Two read-only PulseAudio capture streams (parec) feed a local Whisper model on the GPU:
-  - "them": the monitor of the current default output, re-resolved every few seconds so it follows you
-    when you switch between speakers and headphones (whatever you hear: Zoom, Slack, Meet, …)
+Two read-only capture streams feed a local Whisper model:
+  - "them": whatever is played to the current default output, re-resolved every few seconds so it
+    follows you when you switch between speakers and headphones (Zoom, Slack, Meet, …)
   - "me":   the default microphone
-Capturing a monitor or a microphone never changes routing; this never loads modules or moves streams.
+Capturing never changes routing: no modules are loaded, no streams are moved, no virtual device is added.
+
+Per platform, the capture is a child process that writes 16 kHz mono s16le PCM to its stdout:
+  Linux    parec on the default sink's monitor and on the default source (PulseAudio / PipeWire)
+  macOS    heard-tap (macos/heard-tap.swift): a Core Audio process tap for "them", the input device for "me"
+  Windows  this script in `tap` mode: a WASAPI loopback input for "them", the default microphone for "me"
 
 Utterances go into ~/.local/share/heard/heard.db (SQLite FTS5); `heard` searches them.
 Nothing leaves the machine. `heard pause` / `heard resume` toggle capture; rows older than
 HEARD_RETENTION_DAYS (default 7) are deleted hourly.
 
-Environment overrides: HEARD_THEM_SOURCE, HEARD_ME_SOURCE, HEARD_MODEL, HEARD_RETENTION_DAYS.
+Environment overrides: HEARD_THEM_SOURCE, HEARD_ME_SOURCE, HEARD_MODEL, HEARD_CPU_MODEL, HEARD_CPU_THREADS,
+HEARD_RETENTION_DAYS.
 """
 import ctypes
 import glob
+import importlib.util
 import json
 import os
 import queue
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -36,6 +45,10 @@ import time
 from pathlib import Path
 
 import numpy
+
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = not (IS_MAC or IS_WINDOWS)
 
 SAMPLE_RATE = 16000
 FRAME_SECONDS = 0.03
@@ -53,11 +66,11 @@ PAUSE_FLAG = DATA_DIRECTORY / "paused"
 LIVE_PATH = DATA_DIRECTORY / "live.json"   # in-progress (partial) text per speaker, for `heard -f`
 
 THEM_SOURCE = os.environ.get("HEARD_THEM_SOURCE", "")   # empty: follow the current default output
-SOURCE_CHECK_SECONDS = 2.0
-ME_SOURCE = os.environ.get("HEARD_ME_SOURCE", "@DEFAULT_SOURCE@")
+ME_SOURCE = os.environ.get("HEARD_ME_SOURCE", "")       # empty: the default microphone
+SOURCE_CHECK_SECONDS = 5.0 if IS_WINDOWS else 2.0       # the Windows check starts a Python process
 MODEL_NAME = os.environ.get("HEARD_MODEL", "large-v3-turbo")
-CPU_MODEL_NAME = os.environ.get("HEARD_CPU_MODEL", "small.en")   # used when the GPU is unusable
-CPU_THREADS = int(os.environ.get("HEARD_CPU_THREADS", "6"))      # half the cores, so calls stay smooth
+CPU_MODEL_NAME = os.environ.get("HEARD_CPU_MODEL", "small.en")   # used when there is no usable GPU
+CPU_THREADS = int(os.environ.get("HEARD_CPU_THREADS", str(max(2, (os.cpu_count() or 12) // 2))))   # half the cores
 RETENTION_DAYS = float(os.environ.get("HEARD_RETENTION_DAYS", "7"))
 
 stopping = threading.Event()
@@ -69,16 +82,142 @@ def log(message):
     print(time.strftime("%H:%M:%S"), message, flush=True)
 
 
+# --- capture back ends -------------------------------------------------------------------------------
+
+def mac_helper():
+    """heard-tap, built by macos/install.sh: next to this script, or on PATH."""
+    beside = Path(__file__).resolve().parent / "heard-tap"
+    helper = str(beside) if beside.exists() else shutil.which("heard-tap")
+    if not helper:
+        sys.exit("heard-tap not found: run macos/install.sh (it builds and installs it next to heard-daemon)")
+    return helper
+
+
+def query_helper(what):
+    """Ask the platform helper a question (default-output / default-input); '' if it cannot answer."""
+    if IS_MAC:
+        command = [mac_helper(), what]
+    else:
+        command = [sys.executable, os.path.abspath(__file__), "tap", what]
+    result = subprocess.run(command, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def default_output_monitor():
+    """Where "them" is right now: the monitor of the default sink (Linux), the default output device
+    (macOS, by UID), or the WASAPI loopback of the default output (Windows, by name)."""
+    if IS_LINUX:
+        result = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True)
+        return result.stdout.strip() + ".monitor"
+    return query_helper("default-output")
+
+
+def default_input():
+    if IS_LINUX:
+        return "@DEFAULT_SOURCE@"
+    return query_helper("default-input")
+
+
+def capture_command(speaker, source):
+    if IS_MAC:
+        return [mac_helper(), speaker, source]
+    if IS_WINDOWS:
+        return [sys.executable, os.path.abspath(__file__), "tap", speaker, source]
+    return ["parec", f"--device={source}", "--raw", "--format=s16le", f"--rate={SAMPLE_RATE}",
+            "--channels=1", "--latency-msec=100", f"--client-name=heard ({speaker})"]
+
+
+def windows_tap(arguments):
+    """`heard-daemon tap default-output|default-input|them [device]|me [device]` on Windows: the
+    parec / heard-tap equivalent, run as a child process so each capture gets a fresh device list.
+    "them" is the WASAPI loopback input that PortAudio exposes for every output device."""
+    import sounddevice
+
+    wasapi_index = next((index for index, api in enumerate(sounddevice.query_hostapis())
+                         if api["name"] == "Windows WASAPI"), None)
+    if wasapi_index is None:
+        sys.exit("no WASAPI host API; Windows Vista or newer is required")
+    wasapi = sounddevice.query_hostapis(wasapi_index)
+    devices = [(index, device) for index, device in enumerate(sounddevice.query_devices())
+               if device["hostapi"] == wasapi_index]
+
+    def loopback_of(output_name):
+        wanted = f"{output_name} [Loopback]"
+        for index, device in devices:
+            if device["name"] == wanted and device["max_input_channels"] > 0:
+                return index, device
+        sys.exit(f"no loopback input for output {output_name!r}; is sounddevice >= 0.5 installed?")
+
+    def by_name(name):
+        for index, device in devices:
+            if device["name"] == name and device["max_input_channels"] > 0:
+                return index, device
+        sys.exit(f"no input device named {name!r}")
+
+    what = arguments[0] if arguments else ""
+    wanted = arguments[1] if len(arguments) > 1 and arguments[1] else ""
+    if what == "default-output":
+        output = sounddevice.query_devices(wasapi["default_output_device"])
+        print(loopback_of(output["name"])[1]["name"])
+        return 0
+    if what == "default-input":
+        print(sounddevice.query_devices(wasapi["default_input_device"])["name"])
+        return 0
+    if what == "them":
+        index, device = by_name(wanted) if wanted else loopback_of(
+            sounddevice.query_devices(wasapi["default_output_device"])["name"])
+    elif what == "me":
+        index, device = by_name(wanted) if wanted else (
+            wasapi["default_input_device"], sounddevice.query_devices(wasapi["default_input_device"]))
+    else:
+        sys.exit("usage: heard-daemon tap default-output | default-input | them [device] | me [device]")
+
+    rate = int(device["default_samplerate"])
+    channels = min(2, int(device["max_input_channels"]))
+    block = int(rate * FRAME_SECONDS)
+    print(f"capturing {what}: {device['name']} at {rate} Hz, {channels} ch", file=sys.stderr, flush=True)
+    out = sys.stdout.buffer
+    with sounddevice.InputStream(device=index, channels=channels, samplerate=rate, dtype="float32",
+                                 blocksize=block) as stream:
+        while True:
+            frames, _ = stream.read(block)
+            mono = frames.mean(axis=1) if frames.ndim == 2 else frames
+            resampled = resample_to_16k(mono, rate)
+            out.write((numpy.clip(resampled, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+            out.flush()
+
+
+def resample_to_16k(mono, rate):
+    """Good enough for speech recognition: average whole groups of samples when the rate divides
+    evenly (48 kHz → 16 kHz), linear interpolation otherwise (44.1 kHz)."""
+    if rate == SAMPLE_RATE:
+        return mono
+    if rate % SAMPLE_RATE == 0:
+        factor = rate // SAMPLE_RATE
+        usable = len(mono) - len(mono) % factor
+        return mono[:usable].reshape(-1, factor).mean(axis=1)
+    count = int(round(len(mono) * SAMPLE_RATE / rate))
+    positions = numpy.arange(count) * (rate / SAMPLE_RATE)
+    return numpy.interp(positions, numpy.arange(len(mono)), mono)
+
+
+# --- the daemon -----------------------------------------------------------------------------------
+
 def preload_cuda_libraries():
-    """faster-whisper (CTranslate2) dlopens cuBLAS/cuDNN; load the pip-installed copies first."""
-    import nvidia.cublas.lib
-    import nvidia.cudnn.lib
-    for library_directory in (nvidia.cublas.lib.__path__[0], nvidia.cudnn.lib.__path__[0]):
-        for library in sorted(glob.glob(os.path.join(library_directory, "lib*.so*"))):
-            try:
-                ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
+    """faster-whisper (CTranslate2) dlopens cuBLAS/cuDNN; load the pip-installed copies first
+    (lib/*.so on Linux, bin/*.dll on Windows)."""
+    for package in ("nvidia.cublas", "nvidia.cudnn"):
+        spec = importlib.util.find_spec(package)
+        for root in (spec.submodule_search_locations or []) if spec else []:
+            libraries = sorted(glob.glob(os.path.join(root, "lib", "lib*.so*")) +
+                               glob.glob(os.path.join(root, "bin", "*.dll")))
+            for library in libraries:
+                try:
+                    if IS_WINDOWS:
+                        os.add_dll_directory(os.path.dirname(library))
+                    ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
 
 
 def open_database():
@@ -92,12 +231,6 @@ def open_database():
     return connection
 
 
-def default_output_monitor():
-    """The monitor of whatever output is the default right now (speakers, headphones, …)."""
-    result = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True)
-    return result.stdout.strip() + ".monitor"
-
-
 def capture(speaker, resolve_source, chunks):
     """Read one source forever, cut it into utterances with a simple energy gate, queue them.
 
@@ -107,10 +240,8 @@ def capture(speaker, resolve_source, chunks):
         source = resolve_source()
         last_check = time.time()
         switched = False
-        command = ["parec", f"--device={source}", "--raw", "--format=s16le", f"--rate={SAMPLE_RATE}",
-                   "--channels=1", "--latency-msec=100", f"--client-name=heard ({speaker})"]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        log(f"capturing {speaker} from {source}")
+        process = subprocess.Popen(capture_command(speaker, source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        log(f"capturing {speaker} from {source or 'the default device'}")
         noise_floor = 200.0
         utterance_frames = []
         speech_frames = 0
@@ -158,22 +289,28 @@ def capture(speaker, resolve_source, chunks):
         if switched:
             log(f"{speaker}: output changed, following it")
         elif not stopping.is_set():
-            log(f"{speaker} capture from {source} ended; retrying in 5 s")
+            log(f"{speaker} capture from {source or 'the default device'} ended; retrying in 5 s")
             time.sleep(5)
 
 
 def load_model():
-    """The big model on the GPU; if CUDA is broken (e.g. the driver wants a reboot after a
-    suspend/resume fault), a small English model on the CPU so transcripts keep coming."""
+    """The big model on the GPU (Linux and Windows with NVIDIA CUDA); if CUDA is unusable (no GPU,
+    or the driver wants a reboot after a suspend/resume fault), a small English model on the CPU so
+    transcripts keep coming. macOS has no CUDA: the CPU model, or HEARD_MODEL if set."""
     from faster_whisper import WhisperModel
-    try:
-        preload_cuda_libraries()
-        model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
-        log(f"model {MODEL_NAME} loaded on the GPU")
-    except Exception as error:
-        log(f"GPU unavailable ({error}); using {CPU_MODEL_NAME} on the CPU")
-        model = WhisperModel(CPU_MODEL_NAME, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
-        log(f"model {CPU_MODEL_NAME} loaded on the CPU")
+    if IS_MAC:
+        name = os.environ.get("HEARD_MODEL", CPU_MODEL_NAME)
+    else:
+        try:
+            preload_cuda_libraries()
+            model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
+            log(f"model {MODEL_NAME} loaded on the GPU")
+            return model
+        except Exception as error:
+            log(f"GPU unavailable ({error}); using {CPU_MODEL_NAME} on the CPU")
+            name = CPU_MODEL_NAME
+    model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+    log(f"model {name} loaded on the CPU ({CPU_THREADS} threads)")
     return model
 
 
@@ -224,9 +361,11 @@ def clean_up(connection):
 
 
 def exit_before_sleep():
-    """A CUDA context kept across suspend/resume faulted the GPU (NVIDIA Xid 31 → "reboot required").
-    So hold a logind delay lock, and when sleep is announced, exit: the lock is released with the
-    process, the machine sleeps, and systemd starts a fresh process (fresh CUDA context) after resume."""
+    """Linux only. A CUDA context kept across suspend/resume faulted the GPU (NVIDIA Xid 31 → "reboot
+    required"). So hold a logind delay lock, and when sleep is announced, exit: the lock is released
+    with the process, the machine sleeps, and systemd starts a fresh process (fresh CUDA context) after
+    resume. On macOS and Windows the capture child simply exits when its device goes quiet and is
+    restarted by capture()."""
     inhibitor = subprocess.Popen(
         ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=heard",
          "--why=release the GPU before suspend", "sleep", "infinity"],
@@ -244,15 +383,20 @@ def exit_before_sleep():
 
 
 def main():
+    if IS_WINDOWS and sys.argv[1:2] == ["tap"]:
+        return windows_tap(sys.argv[2:])
     connection = open_database()
     chunks = queue.Queue(maxsize=200)
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+    resolve_them = (lambda: THEM_SOURCE) if THEM_SOURCE else default_output_monitor
+    resolve_me = (lambda: ME_SOURCE) if ME_SOURCE else default_input
     workers = [
-        threading.Thread(target=capture, args=("them", (lambda: THEM_SOURCE) if THEM_SOURCE else default_output_monitor, chunks), daemon=True),
-        threading.Thread(target=capture, args=("me", lambda: ME_SOURCE, chunks), daemon=True),
+        threading.Thread(target=capture, args=("them", resolve_them, chunks), daemon=True),
+        threading.Thread(target=capture, args=("me", resolve_me, chunks), daemon=True),
         threading.Thread(target=clean_up, args=(connection,), daemon=True),
-        threading.Thread(target=exit_before_sleep, daemon=True),
     ]
+    if IS_LINUX:
+        workers.append(threading.Thread(target=exit_before_sleep, daemon=True))
     for worker in workers:
         worker.start()
     try:

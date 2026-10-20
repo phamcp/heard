@@ -54,11 +54,11 @@ def main():
             PAUSE_FLAG.touch()
         elif command == "resume":
             PAUSE_FLAG.unlink(missing_ok=True)
-        print("heard is", "PAUSED" if PAUSE_FLAG.exists() else "capturing (if heard.service is running)")
+        print("heard is", "PAUSED" if PAUSE_FLAG.exists() else "capturing (if heard-daemon is running)")
         return 0
 
     if not DATABASE_PATH.exists():
-        print("No transcript yet: heard.service has not written anything.", file=sys.stderr)
+        print("No transcript yet: heard-daemon has not written anything.", file=sys.stderr)
         return 1
     connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
     since = time.time() - arguments.last if arguments.last else 0
@@ -94,6 +94,8 @@ def live_line(newest):
 
 def follow(connection, newest):
     interactive = sys.stdout.isatty()
+    if interactive and os.name == "nt":
+        os.system("")   # turns on ANSI escape handling in the classic Windows console
     shown_live = ""
     while True:
         time.sleep(0.25)

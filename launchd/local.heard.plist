@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- macOS user agent for heard. macos/install.sh fills in __HOME__ (launchd does not expand ~)
+	     and loads it with `launchctl bootstrap gui/$UID`. KeepAlive restarts the daemon whenever it
+	     exits, like Restart=always in systemd/heard.service.
+
+	     The daemon runs under `heard-tap supervise` so that the Microphone and System Audio Recording
+	     permissions are attributed to heard-tap rather than to uv or python. -->
+	<key>Label</key>
+	<string>local.heard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/.local/bin/heard-tap</string>
+		<string>supervise</string>
+		<string>__HOME__/.local/bin/heard-daemon</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/heard.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/heard.log</string>
+</dict>
+</plist>

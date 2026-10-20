@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Embedded into the heard-tap binary so macOS can show the privacy prompts for a bare executable. -->
+	<key>CFBundleIdentifier</key>
+	<string>local.heard.tap</string>
+	<key>CFBundleName</key>
+	<string>heard-tap</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>heard transcribes what you say (locally; audio is never stored).</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>heard transcribes what you hear (locally; audio is never stored).</string>
+</dict>
+</plist>
