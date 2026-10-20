@@ -32,9 +32,10 @@ if ($Uninstall) {
     Stop-Heard
     foreach ($task in $tasks.Values) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
     foreach ($name in $names) { Remove-Item (Join-Path $startup "$name.lnk") -ErrorAction SilentlyContinue }
-    foreach ($file in @("heard", "heard-daemon", "heard-ui", "heard.cmd", "heard-daemon.vbs", "heard-ui.vbs")) {
+    foreach ($file in @("heard", "heard-daemon", "heard-ui", "heard.cmd", "heard-daemon.vbs", "heard-ui.vbs", "heard.vbs", "heard.ico")) {
         Remove-Item (Join-Path $bin $file) -ErrorAction SilentlyContinue
     }
+    Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk") -ErrorAction SilentlyContinue
     Write-Host "heard is uninstalled. Transcripts stay in $data, call logs in $env:USERPROFILE\Documents\heard."
     exit 0
 }
@@ -60,6 +61,28 @@ WScript.Quit shell.Run("cmd /c """"$uv"" run --script ""$script"" >> ""$log"" 2>
     $launchers[$name] = $launcher
 }
 Write-Host "installed heard, heard-daemon, heard-ui and heard.cmd in $bin"
+
+# The desktop shortcut: make sure the daemon runs (through its task when there is one, so it keeps the
+# restart policy), then start the overlay, or bring a running one to the front (a second heard-ui does that).
+$opener = Join-Path $bin "heard.vbs"
+@"
+Set shell = CreateObject("WScript.Shell")
+If shell.Run("schtasks /Run /TN ""$($tasks['heard-daemon'])""", 0, True) <> 0 Then
+    shell.Run "wscript.exe ""$($launchers['heard-daemon'])""", 0, False
+End If
+shell.Run "wscript.exe ""$($launchers['heard-ui'])""", 0, False
+"@ | Set-Content -Path $opener -Encoding Unicode
+$icon = Join-Path $bin "heard.ico"
+& $uv run --script (Join-Path $bin "heard-ui") --write-icon $icon 2>$null | Out-Null
+$desktopLink = Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk"
+$link = (New-Object -ComObject WScript.Shell).CreateShortcut($desktopLink)
+$link.TargetPath = "wscript.exe"
+$link.Arguments = "`"$opener`""
+$link.WorkingDirectory = $bin
+$link.Description = "Heard: local call transcripts. Opens the overlay; nothing is captured until you press Start listening."
+if (Test-Path $icon) { $link.IconLocation = "$icon,0" }
+$link.Save()
+Write-Host "added a Heard shortcut to your desktop"
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not $userPath -or ($userPath -split ";") -notcontains $bin) {

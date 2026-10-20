@@ -47,6 +47,7 @@ LIVE_PATH = DATA_DIRECTORY / "live.json"
 HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"
 CONFIG_PATH = DATA_DIRECTORY / "ui-config.json"
 SESSION_PATH = DATA_DIRECTORY / "session.json"   # the current call's start time, kept across overlay restarts
+SHOW_REQUEST = DATA_DIRECTORY / "show-request"   # a second launch (desktop shortcut) asks the running overlay to show
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
 MINI_WIDTH, MINI_HEIGHT = 112, 38   # collapsed: logo, play/pause, stop
@@ -874,11 +875,12 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
-def tray_icon(listening):
-    pixmap = QPixmap(44, 44)
+def tray_icon(listening, size=44):
+    pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
+    painter.scale(size / 44, size / 44)   # drawn on a 44 px grid
     painter.setPen(Qt.NoPen)
     painter.setBrush(QColor("#ff3b30") if listening else QColor(140, 140, 140))
     painter.drawEllipse(6, 6, 32, 32)
@@ -960,9 +962,14 @@ def main():
     if IS_WINDOWS:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    if sys.argv[1:2] == ["--write-icon"]:   # used by windows/install.ps1 for the desktop shortcut
+        app = QApplication(sys.argv[:1])
+        written = tray_icon(False, 256).pixmap(256, 256).save(sys.argv[2], "ICO")
+        return 0 if written else 1
     lock = None if os.environ.get("HEARD_UI_SCREENSHOT") else single_instance("ui")
     if lock is None and not os.environ.get("HEARD_UI_SCREENSHOT"):
-        print("heard-ui: already running", file=sys.stderr)
+        SHOW_REQUEST.touch()   # the running overlay picks this up and comes to the front
+        print("heard-ui: already running; asked it to show", file=sys.stderr)
         return 0
     app = QApplication(sys.argv)
     app.setApplicationName("Heard")
@@ -986,6 +993,16 @@ def main():
     overlay.place_at_top()
     overlay.show()
     platform_setup(overlay)
+    SHOW_REQUEST.unlink(missing_ok=True)
+
+    def check_show_request():
+        if SHOW_REQUEST.exists():
+            SHOW_REQUEST.unlink(missing_ok=True)
+            overlay.show()
+            overlay.raise_()
+    show_timer = QTimer(app)
+    show_timer.timeout.connect(check_show_request)
+    show_timer.start(500)
 
     tray = QSystemTrayIcon(tray_icon(store.listening))
     menu = QMenu()
