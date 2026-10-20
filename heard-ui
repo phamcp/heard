@@ -527,6 +527,8 @@ class LogsPane(QWidget):
         self.list = QListWidget()
         self.list.setFixedWidth(250)
         self.list.setFocusPolicy(Qt.NoFocus)
+        self.list.setWordWrap(True)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.currentItemChanged.connect(lambda current, _previous: self.show_log(current))
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
