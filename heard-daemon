@@ -111,11 +111,10 @@ def query_helper(what):
 
 
 def default_output_monitor():
-    """Where "them" is right now: the monitor of the default sink (Linux), the default output device
-    (macOS, by UID), or the WASAPI loopback of the default output (Windows, by name)."""
-    if IS_LINUX:
-        result = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True)
-        return result.stdout.strip() + ".monitor"
+    """Where "them" is right now: every output device, mixed (Linux and Windows: "all outputs: " plus their
+    names, so adding or removing one restarts the capture), or the default output device (macOS, by UID)."""
+    if IS_LINUX:   # every sink, mixed (see linux_tap_all_outputs); the set changing restarts the capture
+        return ALL_OUTPUTS + "; ".join(sorted(linux_sinks()))
     return query_helper("default-output")
 
 
@@ -128,7 +127,7 @@ def default_input():
 def capture_command(speaker, source):
     if IS_MAC:
         return [mac_helper(), speaker, source]
-    if IS_WINDOWS:
+    if IS_WINDOWS or (speaker == "them" and source.startswith(ALL_OUTPUTS)):
         return [sys.executable, os.path.abspath(__file__), "tap", speaker, source]
     return ["parec", f"--device={source}", "--raw", "--format=s16le", f"--rate={SAMPLE_RATE}",
             "--channels=1", "--latency-msec=100", f"--client-name=heard ({speaker})"]
@@ -205,14 +204,15 @@ def windows_tap(arguments):
 ALL_OUTPUTS = "all outputs: "
 
 
-def windows_tap_all_outputs(audio, pyaudio):
-    """"them" on Windows by default: the loopback of every output device, mixed into one stream.
+def mix_outputs(outputs, read_output):
+    """"them" by default on Windows and Linux: every output device at once, mixed into one stream.
 
     Apps can send sound to any output (Zoom's own speaker setting, a browser tab on the monitor's
-    speakers), not only the Windows default, so listen to all of them. Each device is read in its own
-    thread into a 16 kHz buffer; the mixer writes one 30 ms frame on a steady clock, adding whatever
-    each device has and silence for the rest. A silent loopback delivers no data at all, so this also
-    keeps the stream flowing (and utterances closing) when nothing is playing."""
+    speakers), not only the system default, so listen to all of them. `outputs` is [(name, handle)];
+    read_output(handle, push) reads one output until it fails, calling push() with 16 kHz mono float32
+    samples. Each output is read in its own thread into a buffer; the mixer writes one 30 ms frame on a
+    steady clock, adding whatever each output has and silence for the rest. A silent Windows loopback
+    delivers no data at all, so this also keeps the stream flowing (and utterances closing) then."""
     import collections
     import threading
 
@@ -220,38 +220,30 @@ def windows_tap_all_outputs(audio, pyaudio):
     max_buffered = SAMPLE_RATE // 2   # more than 0.5 s queued means drift or a burst: drop the oldest
     buffers, primed, lock = {}, set(), threading.Lock()
 
-    def read(device):
-        rate = int(device["defaultSampleRate"])
-        channels = max(1, int(device["maxInputChannels"]))
-        block = int(rate * FRAME_SECONDS)
-        try:
-            stream = audio.open(format=pyaudio.paFloat32, channels=channels, rate=rate, input=True,
-                                input_device_index=device["index"], frames_per_buffer=block)
-        except OSError as error:
-            print(f"skipping {device['name']}: {error}", file=sys.stderr, flush=True)
-            return
+    def run(key, name, handle):
         buffer = collections.deque()
-        with lock:
-            buffers[device["index"]] = buffer
-        try:
-            while True:
-                frames = numpy.frombuffer(stream.read(block, exception_on_overflow=False), dtype=numpy.float32)
-                mono = frames.reshape(-1, channels).mean(axis=1) if channels > 1 else frames
-                with lock:
-                    buffer.extend(resample_to_16k(mono, rate).tolist())
-                    while len(buffer) > max_buffered:
-                        buffer.popleft()
-        except OSError as error:   # unplugged: the daemon's device check restarts us with the new set
-            print(f"{device['name']} stopped: {error}", file=sys.stderr, flush=True)
-            with lock:
-                buffers.pop(device["index"], None)
 
-    devices = list(audio.get_loopback_device_info_generator())
-    if not devices:
+        def push(samples):
+            with lock:
+                buffer.extend(samples.tolist())
+                while len(buffer) > max_buffered:
+                    buffer.popleft()
+
+        with lock:
+            buffers[key] = buffer
+        try:
+            read_output(handle, push)
+        except OSError as error:   # unplugged: the daemon's device check restarts us with the new set
+            print(f"{name} stopped: {error}", file=sys.stderr, flush=True)
+        finally:
+            with lock:
+                buffers.pop(key, None)
+
+    if not outputs:
         sys.exit("no output devices to listen to")
-    for device in devices:
-        threading.Thread(target=read, args=(device,), daemon=True).start()
-    print("capturing them: all outputs: " + ", ".join(device["name"] for device in devices), file=sys.stderr, flush=True)
+    for key, (name, handle) in enumerate(outputs):
+        threading.Thread(target=run, args=(key, name, handle), daemon=True).start()
+    print("capturing them: all outputs: " + ", ".join(name for name, _ in outputs), file=sys.stderr, flush=True)
 
     out = sys.stdout.buffer
     next_tick = time.monotonic()
@@ -279,8 +271,53 @@ def windows_tap_all_outputs(audio, pyaudio):
                 next_tick = time.monotonic()
     except (BrokenPipeError, OSError):
         return 0
+
+
+def windows_tap_all_outputs(audio, pyaudio):
+    """The WASAPI loopback of every output device (PyAudioWPatch), mixed by mix_outputs()."""
+    def read(device, push):
+        rate = int(device["defaultSampleRate"])
+        channels = max(1, int(device["maxInputChannels"]))   # WASAPI shared mode wants the device's own layout
+        block = int(rate * FRAME_SECONDS)
+        stream = audio.open(format=pyaudio.paFloat32, channels=channels, rate=rate, input=True,
+                            input_device_index=device["index"], frames_per_buffer=block)
+        try:
+            while True:
+                frames = numpy.frombuffer(stream.read(block, exception_on_overflow=False), dtype=numpy.float32)
+                mono = frames.reshape(-1, channels).mean(axis=1) if channels > 1 else frames
+                push(resample_to_16k(mono, rate))
+        finally:
+            stream.close()
+
+    try:
+        return mix_outputs([(device["name"], device) for device in audio.get_loopback_device_info_generator()], read)
     finally:
         audio.terminate()
+
+
+def linux_sinks():
+    """Every PulseAudio / PipeWire output (sink) by name."""
+    result = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True)
+    return [line.split("\t")[1] for line in result.stdout.splitlines() if line.count("\t") >= 1]
+
+
+def linux_tap_all_outputs():
+    """`heard-daemon tap them` on Linux: parec on the monitor of every sink, mixed by mix_outputs().
+    Read-only like the single-sink capture: no modules loaded, no streams moved."""
+    def read(sink, push):
+        process = subprocess.Popen(["parec", f"--device={sink}.monitor", "--raw", "--format=s16le",
+                                    f"--rate={SAMPLE_RATE}", "--channels=1", "--latency-msec=30",
+                                    "--client-name=heard (them)"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                raw = process.stdout.read(FRAME_SAMPLES * 2)
+                if not raw:
+                    raise OSError("parec ended")
+                push(numpy.frombuffer(raw[:len(raw) // 2 * 2], dtype="<i2").astype(numpy.float32) / 32768.0)
+        finally:
+            process.terminate()
+
+    return mix_outputs([(sink, sink) for sink in linux_sinks()], read)
 
 
 def resample_to_16k(mono, rate):
@@ -553,6 +590,8 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         if sys.argv[1:2] == ["tap"]:
             return windows_tap(sys.argv[2:])
+    if IS_LINUX and sys.argv[1:3] == ["tap", "them"]:
+        return linux_tap_all_outputs()
     lock = single_instance("daemon")
     if lock is None:
         log("another heard-daemon is already running; exiting")

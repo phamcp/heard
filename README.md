@@ -16,15 +16,16 @@ Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from scr
 before a call, Stop recording after it: each call becomes a titled Markdown log you can read, copy and search
 later in the overlay's Library.
 
-- **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records the system's default output, not
+- **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records what is played to your outputs, not
   a particular app.
-- **Both sides:** "them" is everything played to your default output; "me" is your default microphone.
+- **Both sides:** "them" is everything played to your outputs (every output device on Linux and Windows, the
+  default output on macOS); "me" is your default microphone.
 - **Local only:** audio never leaves the machine and is never written to disk. Speech is transcribed by
   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on your GPU (or CPU) and only the text is stored
   in a SQLite full-text index under `~/.local/share/heard/`, readable only by you.
 - **Read-only capture:** it never loads modules, moves streams, or installs a virtual audio device, so it is
   safe to start in the middle of a call. Per platform:
-  - Linux: `parec` on the output's monitor source and on the microphone (PulseAudio or PipeWire)
+  - Linux: `parec` on the monitor of every output (sink), mixed, and on the microphone (PulseAudio or PipeWire)
   - macOS: a [Core Audio process tap](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
     on the default output (macOS 14.2+), and the default input device
   - Windows: the WASAPI loopback of every output device, mixed, so it keeps hearing the call when an app
@@ -134,7 +135,7 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | transcript | lines as they land, the sentence in progress dimmed; the search field filters the retained history as you type (word prefixes match; quotes and OR work too), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Summarize, Delete |
 | **Ask** | opens or closes a chat about the live call beside the transcript, which stays on screen. Type a question or tap a quick one (Say next?, Their question?, Objections?, Recap). Answers stream in from the same AI as the summaries, using the call's transcript; follow-ups remember the conversation, and Stop recording starts a new one |
-| collapsed pill | **⌃** shrinks the overlay to a pill: logo (click to expand), play/pause, stop, and a chat button that opens the same chat alone under the pill, without the transcript |
+| collapsed pill | the minimize button (**–**) shrinks the overlay to a pill: logo (click to expand), play/pause, stop, and a chat button that opens the same chat alone under the pill, without the transcript |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
 | ⚙ | the library folder, the AI for summaries and Ask (local model, Claude API, or off), and hiding from screen sharing |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
@@ -143,9 +144,17 @@ Stop recording writes the log at once, titled from the transcript's own words (i
 "staging rollout, IAM change, platform team"). Then a language model names the meeting and adds a Summary, Key
 points and Action items above the transcript, and the file is renamed after the meeting (the start time plus
 that title). By default the model runs locally: install [Ollama](https://ollama.com) and `ollama pull gemma3:12b`
-(about 8 GB; `qwen2.5:7b` is smaller). Settings can switch to the Claude API (it reads `ANTHROPIC_API_KEY` and
-sends the finished transcript to Anthropic) or turn summaries off. If the model is unavailable the log keeps its
-keyword title, and **Summarize** in the Library tries again; it also works on older logs.
+(about 8 GB; `qwen2.5:7b` is smaller). Settings can switch to the Claude API, which sends the finished transcript
+to Anthropic, or turn summaries off. If the model is unavailable the log keeps its keyword title, and
+**Summarize** in the Library tries again; it also works on older logs.
+
+To use the Claude API, pick it in Settings and add a key: **Get a key** opens the API keys page of the Claude
+Console (`platform.claude.com/settings/keys`); create one and copy it, and it fills itself in when you come back
+to Settings (from the clipboard, only while the key field is empty). **Test** checks it with Anthropic, **Save**
+stores it in Windows Credential Manager, the macOS Keychain, or your Linux keyring (GNOME Keyring, KWallet); where
+there is no keyring it goes in `~/.local/share/heard/claude-api-key`, readable only by you. It never goes in the
+settings file. `ANTHROPIC_API_KEY` in the environment works too.
+
 Nothing is filed or cleared until you press Stop recording: the daemon pausing itself after the
 time limit, or a restart, just pauses. Logs are kept until you delete them; the rolling transcript database
 behind the live view still expires after 3 days.
@@ -168,16 +177,20 @@ energy gate (a 0.5 s pause ends one; long monologues are cut every 10 s). Finish
 with voice-activity filtering and stored. While someone is still talking, the utterance so far is re-transcribed
 about once a second into `live.json`, so `heard -f` and the overlay can show live captions.
 
-The capture processes are `parec` on Linux, `heard-tap` on macOS (`macos/heard-tap.swift`, ~300 lines of Swift
-over Core Audio) and the daemon itself in `tap` mode on Windows (PyAudioWPatch, whose PortAudio build exposes
-a loopback input for every output device). Each one writes raw PCM to its stdout. A watcher beside each capture
-re-checks the default device every few seconds (ten on Windows) and restarts the capture when you switch between
-speakers and headphones, and ends it the moment Listening is turned off. While paused, nothing runs.
+The capture processes are `heard-tap` on macOS (`macos/heard-tap.swift`, ~300 lines of Swift over Core Audio),
+and on Linux and Windows the daemon itself in `tap` mode for "them" (a `parec` per sink monitor on Linux;
+PyAudioWPatch on Windows, whose PortAudio build exposes a loopback input for every output device), mixing every
+output on a steady 30 ms clock, plus `parec` (Linux) or `tap me` (Windows) for the microphone. Each one writes
+raw PCM to its stdout. A watcher beside each capture re-checks the devices every few seconds (ten on Windows)
+and restarts the capture when an output is added or removed or you switch microphones, and ends it the moment
+Listening is turned off. While paused, nothing runs.
 
 `heard-ui` is one PySide6 (Qt) script for all three platforms, and runs once per user (a second start exits). It polls the database, `live.json`, the pause
 flag and the daemon's heartbeat file; the only platform-specific parts are the floating non-activating window,
 the global hotkeys (Carbon on macOS, `RegisterHotKey` on Windows) and the screen-capture exclusion
-(`NSWindow.sharingType` on macOS, `SetWindowDisplayAffinity` on Windows).
+(`NSWindow.sharingType` on macOS, `SetWindowDisplayAffinity` on Windows). X11 and Wayland have neither global
+hotkeys for it nor a way to keep one window out of a screen share, so on Linux those two are off and Settings
+says so; everything else (Ask, summaries, the Library, the pill) works the same.
 
 On Linux the daemon holds a systemd-logind *delay* inhibitor and exits just before suspend. systemd restarts it
 after resume with a fresh CUDA context. Keeping a CUDA context across suspend/resume once faulted the NVIDIA
@@ -186,8 +199,9 @@ is restarted on whatever the default device is then. Only one daemon runs per us
 
 Environment overrides: `HEARD_MODEL`, `HEARD_CPU_MODEL`, `HEARD_CPU_THREADS`, `HEARD_RETENTION_DAYS`,
 `HEARD_MAX_LISTEN_MINUTES`, `HEARD_START_LISTENING` (capture from boot instead of starting paused),
-`HEARD_THEM_SOURCE` (a fixed source instead of following the default output: a PulseAudio source name, a
-macOS device UID from `heard-tap list`, or a Windows device name), `HEARD_ME_SOURCE`.
+`HEARD_THEM_SOURCE` (one fixed source instead of every output (the default output on macOS): a PulseAudio
+source name such as `alsa_output.pci-0000_00_1f.3.analog-stereo.monitor`, a macOS device UID from
+`heard-tap list`, or a Windows loopback device name), `HEARD_ME_SOURCE`.
 
 ## Consent
 

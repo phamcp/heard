@@ -4,6 +4,7 @@
 # dependencies = [
 #   "PySide6-Essentials>=6.7",   # QtCore, QtGui, QtWidgets only: a fraction of the full PySide6 download
 #   "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
+#   "keyring>=25",               # the Claude API key lives in Windows Credential Manager / macOS Keychain
 # ]
 # ///
 """heard-ui: a light overlay for heard. macOS, Windows, Linux (one Qt script).
@@ -30,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QGridLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = not (IS_MAC or IS_WINDOWS)
 MOD = "⌘⇧" if IS_MAC else "Ctrl+Shift+"
 
 DATA_DIRECTORY = Path.home() / ".local/share/heard"
@@ -243,8 +245,85 @@ def _ask_local(model, system, user):
     return json.loads(reply["message"]["content"])
 
 
+KEYRING_SERVICE, KEYRING_USER = "heard", "anthropic-api-key"
+API_KEY_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")
+CONSOLE_KEYS_URL = "https://platform.claude.com/settings/keys"
+KEY_FILE = DATA_DIRECTORY / "claude-api-key"   # only where the OS has no credential store (often on Linux)
+
+
+def _keyring_usable():
+    """The OS credential store when there is a real one: Windows Credential Manager, macOS Keychain, or a
+    Secret Service (GNOME Keyring, KWallet) on Linux. Not keyring's fail or plaintext fallbacks."""
+    try:
+        import keyring
+        backend = keyring.get_keyring()
+        return keyring if backend.priority >= 1 and "fail" not in type(backend).__module__ else None
+    except Exception:
+        return None
+
+
+def key_store_name():
+    if _keyring_usable():
+        return "Windows Credential Manager" if IS_WINDOWS else "the macOS Keychain" if IS_MAC else "your keyring"
+    return f"{KEY_FILE} (readable only by you)"
+
+
+def stored_claude_key():
+    keyring = _keyring_usable()
+    if keyring:
+        try:
+            key = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+            if key:
+                return key
+        except Exception:
+            pass
+    try:
+        return KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def store_claude_key(key):
+    """Save the key in the OS credential store (else an owner-only file), or forget it when key is empty."""
+    keyring = _keyring_usable()
+    if not key:
+        if keyring:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+            except Exception:
+                pass
+        KEY_FILE.unlink(missing_ok=True)
+        return
+    if keyring:
+        try:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USER, key)
+            KEY_FILE.unlink(missing_ok=True)
+            return
+        except Exception:
+            pass   # a locked or broken keyring: fall back to the file
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(key)
+    os.chmod(KEY_FILE, 0o600)
+
+
+def check_claude_key(key):
+    """(ok, message) from one cheap call: list the models the key can use."""
+    import urllib.error
+    try:
+        _http_json("https://api.anthropic.com/v1/models?limit=1",
+                   headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=15)
+        return True, "Key works"
+    except urllib.error.HTTPError as error:
+        return False, "Anthropic rejected this key" if error.code in (401, 403) else f"Anthropic answered {error.code}"
+    except Exception as error:
+        return False, f"Could not reach Anthropic ({error.__class__.__name__})"
+
+
 def _claude_key():
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    """The saved key, else ANTHROPIC_API_KEY from the environment."""
+    key = stored_claude_key() or os.environ.get("ANTHROPIC_API_KEY", "")
     if not key and IS_WINDOWS:   # set with setx after the overlay started: read the user environment directly
         import winreg
         try:
@@ -348,7 +427,9 @@ def describe_summary_error(error, settings):
     import urllib.error
     if settings.get("summarizer") == "claude":
         if isinstance(error, RuntimeError):
-            return "set ANTHROPIC_API_KEY to use Claude, or pick Local in Settings"
+            return "add your Claude API key in Settings, or pick the local model there"
+        if isinstance(error, urllib.error.HTTPError) and error.code in (401, 403):
+            return "Anthropic rejected the API key; replace it in Settings"
         if isinstance(error, urllib.error.HTTPError):
             return f"the Claude API answered {error.code}"
         return f"could not reach the Claude API ({error})"
@@ -1121,7 +1202,9 @@ class Overlay(QWidget):
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.stop_button = pill("■  Stop recording", store.stop_recording, "stop",
                                 "File this call in the library, clear the view and pause")
-        self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
+        self.expand_button = pill("", self.toggle_expanded, "icon", "Minimize to the pill")
+        self.expand_button.setIcon(glyph_icon("minimize"))
+        self.expand_button.setIconSize(QSize(14, 14))
         self.settings_button = pill("⚙", open_settings, "icon", "Settings")
         self.hide_button = pill("✕", hide_me, "icon", f"Hide ({MOD}H)")
 
@@ -1381,14 +1464,47 @@ class SettingsDialog(QDialog):
         self.local_model.setToolTip("Any model you have pulled in Ollama, e.g. gemma3:12b or qwen2.5:7b")
         self.hide_from_sharing = QCheckBox("Hide Heard from screen sharing and recording (Zoom, Slack, Teams, Meet...)")
         self.hide_from_sharing.setChecked(bool(store.settings.get("hide_from_sharing", True)))
+        if IS_LINUX:   # X11 and Wayland have no per-window "exclude from capture"
+            self.hide_from_sharing.setText("Hiding from screen sharing isn't available on Linux")
+            self.hide_from_sharing.setChecked(False)
+            self.hide_from_sharing.setEnabled(False)
+
+        # Claude API key: shown when the Claude API is picked; kept in the OS credential store (or, where there is
+        # none, an owner-only file), never in the settings file
+        self.has_saved_key = bool(stored_claude_key())
+        self.key = QLineEdit()
+        self.key.setEchoMode(QLineEdit.Password)
+        self.key.setPlaceholderText(f"Saved in {key_store_name()}. Paste a new key to replace it" if self.has_saved_key
+                                    else "Paste your key: sk-ant-...")
+        self.key.textChanged.connect(lambda _text: self.key_status.setText(""))
+        get_key = QLabel(f'<a href="{CONSOLE_KEYS_URL}">Get a key</a>')
+        get_key.setOpenExternalLinks(True)
+        get_key.setToolTip("Opens the Anthropic Console: Create Key, copy it, then come back here")
+        test = QPushButton("Test")
+        test.clicked.connect(self.test_key)
+        self.forget = QPushButton("Forget")
+        self.forget.setToolTip(f"Remove the saved key from {key_store_name()}")
+        self.forget.clicked.connect(self.forget_key)
+        self.forget.setVisible(self.has_saved_key)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.key, 1)
+        key_row.addWidget(test)
+        key_row.addWidget(self.forget)
+        key_row.addWidget(get_key)
+        self.key_status = QLabel("")
+        self.key_status.setWordWrap(True)
+
         form = QFormLayout()
+        self.form = form
         form.addRow("Library folder (Stop recording writes here)", folder_row)
         form.addRow("AI for summaries and Ask", self.summarizer)
         form.addRow("Local model", self.local_model)
+        form.addRow("Claude API key", key_row)
+        form.addRow("", self.key_status)
         form.addRow("Screen sharing", self.hide_from_sharing)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
-                      "the machine unless you choose the Claude API for summaries (it reads ANTHROPIC_API_KEY).")
+                      "the machine unless you choose the Claude API, which sends each transcript to Anthropic.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", note)
@@ -1399,7 +1515,67 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
-        self.resize(520, 160)
+        self.resize(620, 160)
+        self.summarizer.currentIndexChanged.connect(lambda _index: self.show_ai_rows())
+        self.show_ai_rows()
+
+    def show_ai_rows(self):
+        """Local model for Ollama, the key row for Claude; picking Claude with no key picks one up from the clipboard."""
+        engine = self.summarizer.currentData()
+        self.form.setRowVisible(2, engine == "local")
+        self.form.setRowVisible(3, engine == "claude")
+        self.form.setRowVisible(4, engine == "claude")
+        self.forget.setVisible(engine == "claude" and self.has_saved_key)   # setRowVisible re-shows the whole row
+        if engine == "claude" and not self.has_saved_key and not self.key.text():
+            found = API_KEY_PATTERN.search(QApplication.clipboard().text() or "")
+            if found:
+                self.key.setText(found.group(0))
+                self.set_key_status("Found an Anthropic key on your clipboard and filled it in. Test it, then Save.", None)
+            elif os.environ.get("ANTHROPIC_API_KEY"):
+                self.set_key_status("Using ANTHROPIC_API_KEY from your environment. Paste a key here to save it instead.", None)
+            else:
+                self.set_key_status("Click Get a key, create a key in the Anthropic Console and copy it. "
+                                    "It fills in here when you come back.", None)
+        self.adjustSize()
+
+    def changeEvent(self, event):
+        # coming back from the browser with a freshly copied key: fill it in without a paste
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() and not self.has_saved_key \
+                and self.summarizer.currentData() == "claude" and not self.key.text():
+            found = API_KEY_PATTERN.search(QApplication.clipboard().text() or "")
+            if found:
+                self.key.setText(found.group(0))
+                self.set_key_status("Found an Anthropic key on your clipboard and filled it in. Test it, then Save.", None)
+
+    def set_key_status(self, text, ok):
+        self.key_status.setText(text)
+        self.key_status.setStyleSheet("color: #3fb950;" if ok else "color: #f85149;" if ok is False else "color: #888;")
+
+    def current_key(self):
+        return self.key.text().strip() or stored_claude_key() or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    def test_key(self):
+        key = self.current_key()
+        if not key:
+            self.set_key_status("No key yet: paste one first.", False)
+            return
+        self.set_key_status("Testing...", None)
+        QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, message = check_claude_key(key)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.set_key_status(message + (". Save to use it." if ok and self.key.text() else "."), ok)
+
+    def forget_key(self):
+        store_claude_key("")
+        self.has_saved_key = False
+        self.forget.setVisible(False)
+        self.key.clear()
+        self.key.setPlaceholderText("Paste your key: sk-ant-...")
+        self.set_key_status(f"Removed the key from {key_store_name()}.", None)
 
     def choose_folder(self):
         chosen = QFileDialog.getExistingDirectory(self, "Library folder", self.folder.text())
@@ -1407,10 +1583,25 @@ class SettingsDialog(QDialog):
             self.folder.setText(chosen)
 
     def save(self):
+        if self.summarizer.currentData() == "claude":
+            typed = self.key.text().strip()
+            if typed and not typed.startswith("sk-ant-"):
+                self.set_key_status("That doesn't look like an Anthropic API key (they start with sk-ant-).", False)
+                return
+            if typed:
+                try:
+                    store_claude_key(typed)
+                except Exception as error:
+                    self.set_key_status(f"Could not save the key in {key_store_name()}: {error}", False)
+                    return
+            elif not self.current_key():
+                self.set_key_status("Add a key to use the Claude API, or pick the local model.", False)
+                return
         self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
         self.store.settings["summarizer"] = self.summarizer.currentData()
         self.store.settings["local_model"] = self.local_model.text().strip() or DEFAULT_SETTINGS["local_model"]
-        self.store.settings["hide_from_sharing"] = self.hide_from_sharing.isChecked()
+        if not IS_LINUX:
+            self.store.settings["hide_from_sharing"] = self.hide_from_sharing.isChecked()
         save_settings(self.store.settings)
         self.store.logs_changed.emit()
         self.store.settings_changed.emit()
@@ -1453,6 +1644,12 @@ def glyph_icon(kind):
         painter.drawPolyline(QPolygon([QPoint(6, 6), QPoint(7, 21), QPoint(17, 21), QPoint(18, 6)]))
         painter.drawLine(QPoint(10, 10), QPoint(10, 17))
         painter.drawLine(QPoint(14, 10), QPoint(14, 17))
+    elif kind == "minimize":   # the standard window minimize bar
+        pen = QPen(QColor("#9c9c9c"))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(QPoint(5, 16), QPoint(19, 16))
     elif kind == "chat":   # outline speech bubble, same weight as the trash can
         pen = QPen(QColor("#d0d0d0"))
         pen.setWidthF(1.8)
@@ -1603,10 +1800,11 @@ def main():
     menu.addSeparator()
     hide_action = QAction("Hide from screen sharing", menu, checkable=True)
     hide_action.setChecked(bool(store.settings.get("hide_from_sharing", True)))
-    hide_action.toggled.connect(set_hide_from_sharing)
-    menu.addAction(hide_action)
-    store.settings_changed.connect(lambda: set_hide_from_sharing(store.settings.get("hide_from_sharing", True)))
-    menu.addSeparator()
+    if not IS_LINUX:   # nothing to switch on Linux (see set_capture_hidden)
+        hide_action.toggled.connect(set_hide_from_sharing)
+        menu.addAction(hide_action)
+        store.settings_changed.connect(lambda: set_hide_from_sharing(store.settings.get("hide_from_sharing", True)))
+        menu.addSeparator()
     menu.addAction(QAction("Library", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
     menu.addAction(QAction("Open library folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
     menu.addAction(QAction("Settings…", menu, triggered=open_settings))
