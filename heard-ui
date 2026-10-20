@@ -1507,12 +1507,13 @@ class SettingsDialog(QDialog):
                       "the machine unless you choose the Claude API, which sends each transcript to Anthropic.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", note)
+        self.note = note
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout()
         layout.addLayout(form)
+        layout.addWidget(note)   # outside the form: wrapped text in a form row can get clipped
         layout.addWidget(buttons)
         self.setLayout(layout)
         self.resize(620, 160)
@@ -1537,6 +1538,10 @@ class SettingsDialog(QDialog):
                 self.set_key_status("Click Get a key, create a key in the Anthropic Console and copy it. "
                                     "It fills in here when you come back.", None)
         self.adjustSize()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.adjustSize)   # once laid out at its real width, fit the wrapped text
 
     def changeEvent(self, event):
         # coming back from the browser with a freshly copied key: fill it in without a paste
