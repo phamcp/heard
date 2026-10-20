@@ -90,9 +90,16 @@ class Transcript:
         return [(r[0], r[1], r[2], float(r[3])) for r in rows][::-1]
 
     def search(self, query, limit=200):
+        """Live search: plain words match as prefixes ("rene" finds "renewal"); anything with quotes or
+        FTS5 operators is passed through as typed."""
         connection = self._open()
         if not connection:
             return []
+        if not any(token in query for token in ('"', " OR ", " NOT ", "*", "(")):
+            words = re.findall(r"[\w']+", query)
+            if not words:
+                return []
+            query = " ".join(f'"{word}"*' for word in words)
         try:
             rows = connection.execute(
                 "SELECT rowid, speaker, text, started_at FROM utterances WHERE utterances MATCH ? "
@@ -638,10 +645,14 @@ class Overlay(QWidget):
         self.switch = pill("", store.toggle_listening, "switch", f"Start / pause capturing ({MOD}L)")
         self.logs_tab = pill("Library", self.toggle_logs, "tab", "Show the library of logged calls; click again for the live transcript")
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search…  (Enter; clear to go back live)")
+        self.search.setPlaceholderText("Search…  (clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(150)
+        self.search_timer.timeout.connect(lambda: store.search(self.search.text()))
+        self.search.textChanged.connect(lambda text: store.search("") if not text.strip() else self.search_timer.start())
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
-        self.search.textChanged.connect(lambda text: store.search("") if not text else None)
         self.stop_button = pill("■  Stop recording", store.stop_recording, "stop",
                                 "File this call in the library, clear the view and pause")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")

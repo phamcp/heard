@@ -113,7 +113,7 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | starts (or resumes) capturing and shows the transcript; amber while off |
 | **● Listening · Pause** (same key) | red, blinking, with the minutes since the call started; Pause only pauses, the transcript stays |
 | **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
-| transcript | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
+| transcript | lines as they land, the sentence in progress dimmed; the search field filters the retained history as you type (word prefixes match; quotes and OR work too), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Delete |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
 | ⚙ | the library folder |
