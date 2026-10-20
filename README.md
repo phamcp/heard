@@ -48,7 +48,9 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 - **Nothing leaves the machine** by default. Speech is transcribed locally, and meeting summaries come from a local
   model through [Ollama](https://ollama.com). The only exception is opt-in: choosing the Claude API for summaries
   in Settings sends each finished call's transcript to Anthropic.
-- **Hidden from screen sharing.** The overlay window is excluded from screen capture on macOS and Windows.
+- **Hidden from screen sharing.** The overlay and its Settings window are excluded from screen capture on macOS
+  and Windows, so Zoom, Slack, Teams, Meet and recorders don't show them; you still see them. Turn it off with
+  "Hide from screen sharing" in the tray menu or in Settings (takes effect at once).
 
 ## Requirements
 
@@ -131,8 +133,9 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
 | transcript | lines as they land, the sentence in progress dimmed; the search field filters the retained history as you type (word prefixes match; quotes and OR work too), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Summarize, Delete |
+| **Ask** | toggles a chat about the live call: type a question or tap a quick one (What should I say next?, What did they just ask?, Any objections I missed?, Summarize so far). Answers stream in from the same AI as the summaries, using the call's transcript; follow-ups remember the conversation, and Stop recording starts a new one |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
-| ⚙ | the library folder, and where summaries come from (local model, Claude API, or off) |
+| ⚙ | the library folder, the AI for summaries and Ask (local model, Claude API, or off), and hiding from screen sharing |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
 Stop recording writes the log at once, titled from the transcript's own words (its most prominent phrases, e.g.

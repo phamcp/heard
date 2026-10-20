@@ -32,7 +32,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
                                QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -54,7 +54,8 @@ MINI_WIDTH, MINI_HEIGHT = 112, 38   # collapsed: logo, play/pause, stop
 LOG_SUFFIX = " heard.md"
 
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0,   # view_since: last Stop recording
-                    "summarizer": "local", "local_model": "gemma3:12b"}   # summarizer: local (Ollama) | claude | off
+                    "summarizer": "local", "local_model": "gemma3:12b",   # summarizer: local (Ollama) | claude | off
+                    "hide_from_sharing": True}   # keep the overlay out of screen shares and recordings
 
 
 def load_settings():
@@ -197,6 +198,7 @@ def safe_filename(text, limit=60):
 
 OLLAMA_URL = os.environ.get("HEARD_OLLAMA_URL", "http://127.0.0.1:11434")
 SUMMARY_CHUNK_CHARS = 40000   # about 10k tokens per pass; longer calls are summarized in parts, then combined
+MAX_BULLETS = 3               # per list (key points, action items)
 SUMMARY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -214,8 +216,8 @@ Return a JSON object with:
 - title: what the meeting was about, 3 to 8 words. Be specific: name the company, product or topic from the call.
   No date, no quotes, no trailing period.
 - summary: 2 to 4 plain sentences on who met, what for, and where it landed.
-- key_points: up to 7 short bullets with the substance: decisions, numbers, dates, objections, open questions.
-- action_items: who does what and by when, only if it was said in the call. An empty list if there were none.
+- key_points: the 3 most important points at most, one short line each: decisions, numbers, dates, objections.
+- action_items: at most 3, who does what and by when, only if it was said in the call. An empty list if none.
 
 Write plain business English. Use only what is in the transcript; never invent names, numbers or commitments.
 Do not use em dashes."""
@@ -282,8 +284,8 @@ def _tidy(result):
     title = plain(result.get("title", "")).strip("\"'*#").rstrip(".")[:80]
     return {"title": title,
             "summary": plain(result.get("summary", "")),
-            "key_points": [plain(p) for p in result.get("key_points", []) if str(p).strip()][:7],
-            "action_items": [plain(p) for p in result.get("action_items", []) if str(p).strip()][:10]}
+            "key_points": [plain(p) for p in result.get("key_points", []) if str(p).strip()][:MAX_BULLETS],
+            "action_items": [plain(p) for p in result.get("action_items", []) if str(p).strip()][:MAX_BULLETS]}
 
 
 def summarize_transcript(text, settings):
@@ -358,6 +360,76 @@ def describe_summary_error(error, settings):
     return f"the model's answer was unusable ({error.__class__.__name__}); try Summarize again"
 
 
+# --- Ask: questions about the live call ------------------------------------------------------------------
+# The Ask tab sends the transcript so far plus a question to the same model as the summaries (Settings), and
+# streams the answer back. Earlier questions and answers in the same call ride along so follow-ups work.
+
+COACH_PROMPT = """You are a real-time coach for a live call, read in a small overlay while the call goes on.
+The transcript is automatic, so expect misheard words. "me" is the person asking you; "them" is everyone else
+on the call. Coach like an experienced sales leader sitting next to them, so they can act in the next few seconds:
+- Lead with the answer. Keep it under 80 words unless asked for more.
+- When they should say something, give the exact line to say, in double quotes. Make it specific to what was
+  just said: answer the concern with substance or ask the sharp question that moves the call forward. Never
+  settle for generic advice like "acknowledge their concerns".
+- At most 3 short bullets, only if they add something. Don't read the transcript back to them.
+- No headings, no preamble, no recap of the question.
+- Use only what is in the transcript for facts about the call; say so if the transcript doesn't cover it.
+- Never put a number, timeline, price, customer name or product claim in a suggested line unless the transcript
+  says it. Where one is needed, leave a placeholder like [X weeks] or turn it into a question for them.
+Do not use em dashes."""
+COACH_TRANSCRIPT_CHARS = 30000   # the newest part of a long call, about 8k tokens
+QUICK_QUESTIONS = ("What should I say next?", "What did they just ask?", "Any objections I missed?", "Summarize so far")
+
+
+def _stream_local(model, system, messages, on_text):
+    import urllib.request
+    payload = {"model": model, "stream": True, "keep_alive": "30m",   # stays loaded through the call
+               "options": {"temperature": 0.3, "num_ctx": 16384},
+               "messages": [{"role": "system", "content": system}] + messages}
+    request = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=json.dumps(payload).encode("utf-8"),
+                                     headers={"content-type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=300) as response:
+        for raw in response:
+            if raw.strip():
+                event = json.loads(raw)
+                on_text(event.get("message", {}).get("content", ""))
+                if event.get("done"):
+                    break
+
+
+def _stream_claude(system, messages, on_text):
+    import urllib.request
+    key = _claude_key()
+    payload = {"model": _claude_model(key), "max_tokens": 800, "temperature": 0.3, "stream": True,
+               "system": system, "messages": messages}
+    request = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode("utf-8"),
+                                     headers={"content-type": "application/json", "x-api-key": key,
+                                              "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(request, timeout=300) as response:
+        for raw in response:
+            line = raw.decode("utf-8").strip()
+            if line.startswith("data:"):
+                event = json.loads(line[5:])
+                if event.get("type") == "content_block_delta":
+                    on_text(event.get("delta", {}).get("text", ""))
+                elif event.get("type") == "message_stop":
+                    break
+
+
+def ask_about_call(settings, transcript_text, history, question, on_text):
+    """Stream an answer to `question` about the call. `history` is earlier [(question, answer)] of this call."""
+    messages = []
+    for earlier_question, earlier_answer in history[-6:]:
+        messages += [{"role": "user", "content": earlier_question}, {"role": "assistant", "content": earlier_answer}]
+    transcript = transcript_text[-COACH_TRANSCRIPT_CHARS:] or "(nothing transcribed yet)"
+    messages.append({"role": "user", "content": f"Transcript so far:\n{transcript}\n\nQuestion: {question}"})
+    if settings.get("summarizer") == "claude":
+        _stream_claude(COACH_PROMPT, messages, on_text)
+    else:
+        _stream_local(settings.get("local_model") or DEFAULT_SETTINGS["local_model"], COACH_PROMPT, messages, on_text)
+
+
 # --- state --------------------------------------------------------------------------------------------
 
 class Store(QObject):
@@ -367,6 +439,7 @@ class Store(QObject):
     listening_started = Signal()
     recording_stopped = Signal()
     summary_finished = Signal(str, object, str)   # log path, summary (or None), error; emitted from a worker thread
+    settings_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -820,7 +893,8 @@ class LogsPane(QWidget):
         self.summarize_button = pill("Summarize", self.summarize_current,
                                      tooltip="Name this meeting and add a summary, key points and action items")
         self.delete_button = pill("Delete", self.delete_log, tooltip="Move this log to the Trash / delete it")
-        self.delete_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self.delete_button.setIcon(glyph_icon("trash"))
+        self.delete_button.setIconSize(QSize(14, 14))
         tools = QHBoxLayout()
         tools.setContentsMargins(0, 0, 0, 0)
         tools.addWidget(self.copy_button)
@@ -911,6 +985,103 @@ class LogsPane(QWidget):
         self.reload()
 
 
+class ChatPane(QWidget):
+    """Ask: questions about the live call, answered from its transcript by the model chosen in Settings."""
+    delta = Signal(str)       # streamed answer text, from the worker thread
+    finished = Signal(str)    # "" or an error, from the worker thread
+
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.history = []      # [(question, answer)] of this call, sent along so follow-ups work
+        self.shown = []        # what the pane shows, errors included
+        self.pending = None    # [question, answer so far] while an answer streams
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        bar = self.view.verticalScrollBar()
+        bar.rangeChanged.connect(lambda _minimum, maximum: bar.setValue(maximum))   # always show the newest
+        chips = QHBoxLayout()
+        chips.setContentsMargins(0, 0, 0, 0)
+        chips.setSpacing(6)
+        for question in QUICK_QUESTIONS:
+            chips.addWidget(pill(question, lambda _checked=False, q=question: self.ask(q), "tab"))
+        chips.addStretch(1)
+        chips.addWidget(pill("Clear", self.clear, "icon", "Clear this conversation"))
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Ask about this call...  (Enter)")
+        self.input.returnPressed.connect(lambda: self.ask(self.input.text()))
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.view, 1)
+        layout.addLayout(chips)
+        layout.addWidget(self.input)
+        self.setLayout(layout)
+        self.delta.connect(self.on_delta)
+        self.finished.connect(self.on_finished)
+        store.recording_stopped.connect(self.clear)   # a new call starts a new conversation
+        self.render()
+
+    def ask(self, question):
+        question = question.strip()
+        if not question or self.pending:
+            return
+        settings = dict(self.store.settings)
+        if settings.get("summarizer") == "off":
+            self.shown.append((question, "_AI is off. Pick a local model or the Claude API in Settings._"))
+            self.render()
+            return
+        self.input.clear()
+        self.pending = [question, ""]
+        transcript, history = as_text(self.store.lines), list(self.history)
+
+        def work():
+            try:
+                ask_about_call(settings, transcript, history, question, self.delta.emit)
+                self.finished.emit("")
+            except Exception as error:
+                self.finished.emit(describe_summary_error(error, settings).replace("try Summarize again", "ask again"))
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+        self.render()
+
+    def on_delta(self, text):
+        if self.pending:
+            self.pending[1] += text
+            self.render()
+
+    def on_finished(self, error):
+        if not self.pending:
+            return
+        question, answer = self.pending
+        self.pending = None
+        answer = re.sub(r'([“”"])[“”"]+', r"\1", answer.strip())   # doubled quote marks
+        answer = answer.replace(" — ", ", ").replace("—", ", ")
+        if error:
+            self.shown.append((question, (answer + "\n\n" if answer else "") + f"_Could not answer: {error}_"))
+        else:
+            self.history.append((question, answer))
+            self.shown.append((question, answer))
+        self.render()
+
+    def clear(self):
+        if not self.pending:
+            self.history, self.shown = [], []
+            self.render()
+
+    def render(self):
+        turns = self.shown + ([tuple(self.pending)] if self.pending else [])
+        if not turns:
+            self.view.setMarkdown("Ask anything about the call so far: what to say next, what they asked, how to "
+                                  "handle an objection. Answers use the live transcript and the AI chosen in Settings.")
+            return
+        parts = []
+        for question, answer in turns:
+            parts.append(f"**You:** {question}\n\n{answer.replace(chr(0x2014), ', ') or '_thinking..._'}")
+        self.view.setMarkdown("\n\n".join(parts))
+
+
 class Overlay(QWidget):
     def __init__(self, store, hide_me, open_settings):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -925,6 +1096,7 @@ class Overlay(QWidget):
 
         self.switch = pill("", store.toggle_listening, "switch", f"Start / pause capturing ({MOD}L)")
         self.logs_tab = pill("Library", self.toggle_logs, "tab", "Show the library of logged calls; click again for the live transcript")
+        self.ask_tab = pill("Ask", self.toggle_ask, "tab", "Ask AI about this call; click again for the live transcript")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search…  (clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -945,6 +1117,7 @@ class Overlay(QWidget):
         bar.setSpacing(8)
         bar.addWidget(self.switch)
         bar.addWidget(self.logs_tab)
+        bar.addWidget(self.ask_tab)
         for widget in (self.search, self.stop_button, self.expand_button,
                        self.settings_button, self.hide_button):
             bar.addWidget(widget)
@@ -974,8 +1147,10 @@ class Overlay(QWidget):
         self.stack = QStackedWidget()
         self.live_pane = LivePane(store)
         self.logs_pane = LogsPane(store)
+        self.chat_pane = ChatPane(store)
         self.stack.addWidget(self.live_pane)
         self.stack.addWidget(self.logs_pane)
+        self.stack.addWidget(self.chat_pane)
         self.status = QLabel("")
         self.status.setObjectName("status")
         self.status.setContentsMargins(2, 0, 2, 6)
@@ -1067,15 +1242,22 @@ class Overlay(QWidget):
 
     def show_tab(self, index, expand=True):
         self.stack.setCurrentIndex(index)
-        self.logs_tab.setProperty("active", "true" if index == 1 else "false")
-        repolish(self.logs_tab)
+        for tab, tab_index in ((self.logs_tab, 1), (self.ask_tab, 2)):
+            tab.setProperty("active", "true" if index == tab_index else "false")
+            repolish(tab)
         if index == 1:
             self.logs_pane.reload()
         if expand and not self.expanded:
             self.toggle_expanded()
+        if index == 2 and self.expanded:
+            self.activateWindow()   # the overlay doesn't take focus on its own; typing needs it
+            self.chat_pane.input.setFocus()
 
     def toggle_logs(self):
         self.show_tab(0 if self.stack.currentIndex() == 1 else 1)
+
+    def toggle_ask(self):
+        self.show_tab(0 if self.stack.currentIndex() == 2 else 2)
 
     # rendering
     def render_switch(self):
@@ -1122,10 +1304,13 @@ class SettingsDialog(QDialog):
         self.summarizer.setCurrentIndex(max(0, self.summarizer.findData(store.settings.get("summarizer", "local"))))
         self.local_model = QLineEdit(store.settings.get("local_model") or DEFAULT_SETTINGS["local_model"])
         self.local_model.setToolTip("Any model you have pulled in Ollama, e.g. gemma3:12b or qwen2.5:7b")
+        self.hide_from_sharing = QCheckBox("Hide Heard from screen sharing and recording (Zoom, Slack, Teams, Meet...)")
+        self.hide_from_sharing.setChecked(bool(store.settings.get("hide_from_sharing", True)))
         form = QFormLayout()
         form.addRow("Library folder (Stop recording writes here)", folder_row)
-        form.addRow("Meeting titles and summaries", self.summarizer)
+        form.addRow("AI for summaries and Ask", self.summarizer)
         form.addRow("Local model", self.local_model)
+        form.addRow("Screen sharing", self.hide_from_sharing)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
                       "the machine unless you choose the Claude API for summaries (it reads ANTHROPIC_API_KEY).")
@@ -1150,8 +1335,10 @@ class SettingsDialog(QDialog):
         self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
         self.store.settings["summarizer"] = self.summarizer.currentData()
         self.store.settings["local_model"] = self.local_model.text().strip() or DEFAULT_SETTINGS["local_model"]
+        self.store.settings["hide_from_sharing"] = self.hide_from_sharing.isChecked()
         save_settings(self.store.settings)
         self.store.logs_changed.emit()
+        self.store.settings_changed.emit()
         self.accept()
 
 
@@ -1179,7 +1366,19 @@ def glyph_icon(kind):
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(Qt.NoPen)
     painter.setBrush(QColor("#d0d0d0"))
-    if kind == "play":
+    if kind == "trash":   # outline only: lid, handle, can and two ribs
+        pen = QPen(QColor("#c8c8c8"))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(QPoint(4, 6), QPoint(20, 6))
+        painter.drawPolyline(QPolygon([QPoint(9, 6), QPoint(9, 3), QPoint(15, 3), QPoint(15, 6)]))
+        painter.drawPolyline(QPolygon([QPoint(6, 6), QPoint(7, 21), QPoint(17, 21), QPoint(18, 6)]))
+        painter.drawLine(QPoint(10, 10), QPoint(10, 17))
+        painter.drawLine(QPoint(14, 10), QPoint(14, 17))
+    elif kind == "play":
         painter.drawPolygon(QPolygon([QPoint(7, 4), QPoint(20, 12), QPoint(7, 20)]))
     elif kind == "pause":
         painter.drawRoundedRect(5, 4, 5, 16, 1.5, 1.5)
@@ -1192,32 +1391,46 @@ def glyph_icon(kind):
 
 # --- platform glue -----------------------------------------------------------------------------------
 
-def platform_setup(widget):
+def set_capture_hidden(widget, hidden):
+    """Hide a window from screen sharing and recording (Zoom, Slack, Teams, Meet, OBS...) or show it again.
+    Windows 10 2004+: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE); macOS: NSWindowSharingNone.
+    The window stays on your own screen either way. Returns False where the system can't do it."""
+    hidden = hidden and not CAPTURABLE
+    try:
+        if IS_MAC:
+            import objc
+            window = objc.objc_object(c_void_p=int(widget.winId())).window()
+            window.setSharingType_(0 if hidden else 1)
+            return True
+        if IS_WINDOWS:
+            import ctypes.wintypes as wintypes
+            user32 = ctypes.windll.user32
+            user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+            if user32.SetWindowDisplayAffinity(int(widget.winId()), 0x11 if hidden else 0):
+                return True
+            print("heard-ui: could not change screen-capture visibility (hiding needs Windows 10 2004 or newer)",
+                  file=sys.stderr)
+    except Exception as error:
+        print("heard-ui: could not change screen-capture visibility:", error, file=sys.stderr)
+    return False
+
+
+def platform_setup(widget, hide_from_sharing=True):
     """After the window exists: keep it off screen shares, floating over everything, without a Dock icon."""
+    set_capture_hidden(widget, hide_from_sharing)
     if IS_MAC:
         try:
             import objc
             from AppKit import NSApp
             NSApp.setActivationPolicy_(1)   # accessory: no Dock icon, no menu bar takeover
             window = objc.objc_object(c_void_p=int(widget.winId())).window()
-            window.setSharingType_(1 if CAPTURABLE else 0)   # NSWindowSharingNone: invisible to screen sharing/recording
             window.setLevel_(3)                               # NSFloatingWindowLevel
             window.setCollectionBehavior_((1 << 0) | (1 << 8))   # all Spaces, over full-screen apps
             window.setHidesOnDeactivate_(False)
             window.setStyleMask_(window.styleMask() | (1 << 7))   # non-activating panel: clicks don't switch apps
         except Exception as error:
             print("heard-ui: macOS window setup incomplete:", error, file=sys.stderr)
-    elif IS_WINDOWS and not CAPTURABLE:
-        try:
-            import ctypes.wintypes as wintypes
-            user32 = ctypes.windll.user32
-            user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
-            user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
-            if not user32.SetWindowDisplayAffinity(int(widget.winId()), 0x11):   # WDA_EXCLUDEFROMCAPTURE
-                print("heard-ui: could not hide the window from screen capture (needs Windows 10 2004 or newer)",
-                      file=sys.stderr)
-        except Exception as error:
-            print("heard-ui: could not exclude the window from capture:", error, file=sys.stderr)
 
 
 def single_instance(name):
@@ -1267,12 +1480,27 @@ def main():
         if IS_MAC:
             from AppKit import NSApp
             NSApp.activateIgnoringOtherApps_(True)
-        SettingsDialog(store).exec()
+        dialog = SettingsDialog(store)
+        set_capture_hidden(dialog, store.settings.get("hide_from_sharing", True))   # over a shared screen too
+        dialog.exec()
 
     overlay = Overlay(store, hide_me=lambda: overlay.hide(), open_settings=open_settings)
     overlay.place_at_top()
     overlay.show()
-    platform_setup(overlay)
+    platform_setup(overlay, store.settings.get("hide_from_sharing", True))
+
+    def set_hide_from_sharing(hidden):
+        """The tray toggle and Settings both land here; applies at once, no restart."""
+        store.settings["hide_from_sharing"] = bool(hidden)
+        save_settings(store.settings)
+        applied = set_capture_hidden(overlay, hidden)
+        if hide_action.isChecked() != bool(hidden):
+            hide_action.setChecked(bool(hidden))
+        if not applied:
+            store.status_changed.emit("This system can't change screen-sharing visibility")
+        else:
+            store.status_changed.emit("Hidden from screen sharing and recording" if hidden
+                                      else "Visible in screen sharing and recording")
     SHOW_REQUEST.unlink(missing_ok=True)
 
     def check_show_request():
@@ -1289,6 +1517,12 @@ def main():
     menu.addAction(QAction(f"Show / hide overlay\t{MOD}H", menu, triggered=toggle_visible))
     menu.addAction(QAction(f"Start / pause listening\t{MOD}L", menu, triggered=store.toggle_listening))
     menu.addAction(QAction("Stop recording (file in library)", menu, triggered=store.stop_recording))
+    menu.addSeparator()
+    hide_action = QAction("Hide from screen sharing", menu, checkable=True)
+    hide_action.setChecked(bool(store.settings.get("hide_from_sharing", True)))
+    hide_action.toggled.connect(set_hide_from_sharing)
+    menu.addAction(hide_action)
+    store.settings_changed.connect(lambda: set_hide_from_sharing(store.settings.get("hide_from_sharing", True)))
     menu.addSeparator()
     menu.addAction(QAction("Library", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
     menu.addAction(QAction("Open library folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
@@ -1313,6 +1547,8 @@ def main():
                 overlay.show_tab(1)
             elif os.environ.get("HEARD_UI_TAB") == "mini":
                 overlay.toggle_expanded()
+            elif os.environ.get("HEARD_UI_TAB") == "ask":
+                overlay.show_tab(2)
             overlay.grab().save(os.environ["HEARD_UI_SCREENSHOT"])
             app.quit()
         QTimer.singleShot(int(os.environ.get("HEARD_UI_SCREENSHOT_DELAY", "3000")), shoot)
