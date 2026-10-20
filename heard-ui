@@ -58,7 +58,8 @@ LOG_SUFFIX = " heard.md"
 
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0,   # view_since: last Stop recording
                     "summarizer": "local", "local_model": "gemma3:12b",   # summarizer: local (Ollama) | claude | off
-                    "hide_from_sharing": True}   # keep the overlay out of screen shares and recordings
+                    "hide_from_sharing": True,   # keep the overlay out of screen shares and recordings
+                    "claude_workspace": ""}      # wrkspc_... for API keys that aren't scoped to one workspace
 
 
 def load_settings():
@@ -308,15 +309,46 @@ def store_claude_key(key):
     os.chmod(KEY_FILE, 0o600)
 
 
-def check_claude_key(key):
+WORKSPACE_PATTERN = re.compile(r"wrkspc_[A-Za-z0-9]{10,}")
+CONSOLE_WORKSPACES_URL = "https://platform.claude.com/settings/workspaces"
+
+
+def _claude_headers(key, workspace=""):
+    """A key that isn't scoped to one workspace must name the workspace on every request."""
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if workspace:
+        headers["anthropic-workspace-id"] = workspace
+    return headers
+
+
+def claude_error_message(error):
+    """Anthropic's own explanation from an HTTPError body ('' when there is none). Reads the body once."""
+    if getattr(error, "_heard_message", None) is None:
+        try:
+            error._heard_message = json.loads(error.read().decode("utf-8", "replace"))["error"]["message"]
+        except Exception:
+            error._heard_message = ""
+    return error._heard_message
+
+
+def needs_workspace(error):
+    return "anthropic-workspace-id" in claude_error_message(error)
+
+
+def check_claude_key(key, workspace=""):
     """(ok, message) from one cheap call: list the models the key can use."""
     import urllib.error
     try:
-        _http_json("https://api.anthropic.com/v1/models?limit=1",
-                   headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=15)
-        return True, "Key works"
+        _http_json("https://api.anthropic.com/v1/models?limit=1", headers=_claude_headers(key, workspace), timeout=15)
+        return True, "Key works" + (" with this workspace" if workspace else "")
     except urllib.error.HTTPError as error:
-        return False, "Anthropic rejected this key" if error.code in (401, 403) else f"Anthropic answered {error.code}"
+        if needs_workspace(error):
+            return False, ("This key isn't tied to one workspace, so Anthropic needs a workspace ID. Click Find it, "
+                           "copy the ID (wrkspc_...) of the workspace to use, and it fills in here.")
+        if error.code == 401:
+            return False, "Anthropic rejected this key"
+        detail = claude_error_message(error)
+        return False, f"Anthropic answered {error.code}" + (f": {detail}" if detail else "")
     except Exception as error:
         return False, f"Could not reach Anthropic ({error.__class__.__name__})"
 
@@ -336,23 +368,23 @@ def _claude_key():
     return key
 
 
-def _claude_model(key):
+def _claude_model(key, workspace=""):
     """HEARD_CLAUDE_MODEL, else the newest Sonnet the key can use (the models list is newest first)."""
     if os.environ.get("HEARD_CLAUDE_MODEL"):
         return os.environ["HEARD_CLAUDE_MODEL"]
-    listing = _http_json("https://api.anthropic.com/v1/models?limit=100",
-                         headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=30)
+    listing = _http_json("https://api.anthropic.com/v1/models?limit=100", headers=_claude_headers(key, workspace),
+                         timeout=30)
     ids = [model["id"] for model in listing.get("data", [])]
     return next((i for i in ids if "sonnet" in i), ids[0] if ids else "")
 
 
-def _ask_claude(system, user):
+def _ask_claude(system, user, workspace=""):
     key = _claude_key()
     reply = _http_json("https://api.anthropic.com/v1/messages", {
-        "model": _claude_model(key), "max_tokens": 2000, "temperature": 0.2,
+        "model": _claude_model(key, workspace), "max_tokens": 2000, "temperature": 0.2,
         "system": system + "\nReply with only the JSON object.",
         "messages": [{"role": "user", "content": user}],
-    }, headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=300)
+    }, headers=_claude_headers(key, workspace), timeout=300)
     text = "".join(block.get("text", "") for block in reply.get("content", []))
     return json.loads(text[text.find("{"):text.rfind("}") + 1])
 
@@ -371,7 +403,7 @@ def _tidy(result):
 def summarize_transcript(text, settings):
     """{"title", "summary", "key_points", "action_items"} for a transcript in `as_text` form. Raises on failure."""
     if settings.get("summarizer") == "claude":
-        ask = _ask_claude
+        ask = lambda system, user: _ask_claude(system, user, settings.get("claude_workspace", ""))
     else:
         model = settings.get("local_model") or DEFAULT_SETTINGS["local_model"]
         ask = lambda system, user: _ask_local(model, system, user)
@@ -428,10 +460,13 @@ def describe_summary_error(error, settings):
     if settings.get("summarizer") == "claude":
         if isinstance(error, RuntimeError):
             return "add your Claude API key in Settings, or pick the local model there"
-        if isinstance(error, urllib.error.HTTPError) and error.code in (401, 403):
+        if isinstance(error, urllib.error.HTTPError) and needs_workspace(error):
+            return "this API key needs a workspace ID: add it under the key in Settings"
+        if isinstance(error, urllib.error.HTTPError) and error.code == 401:
             return "Anthropic rejected the API key; replace it in Settings"
         if isinstance(error, urllib.error.HTTPError):
-            return f"the Claude API answered {error.code}"
+            detail = claude_error_message(error)
+            return f"the Claude API answered {error.code}" + (f": {detail}" if detail else "")
         return f"could not reach the Claude API ({error})"
     if isinstance(error, urllib.error.HTTPError) and error.code == 404:
         return f"Ollama has no model {settings.get('local_model')}: run  ollama pull {settings.get('local_model')}"
@@ -481,14 +516,13 @@ def _stream_local(model, system, messages, on_text):
                     break
 
 
-def _stream_claude(system, messages, on_text):
+def _stream_claude(system, messages, on_text, workspace=""):
     import urllib.request
     key = _claude_key()
-    payload = {"model": _claude_model(key), "max_tokens": 800, "temperature": 0.3, "stream": True,
+    payload = {"model": _claude_model(key, workspace), "max_tokens": 800, "temperature": 0.3, "stream": True,
                "system": system, "messages": messages}
     request = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode("utf-8"),
-                                     headers={"content-type": "application/json", "x-api-key": key,
-                                              "anthropic-version": "2023-06-01"})
+                                     headers={"content-type": "application/json", **_claude_headers(key, workspace)})
     with urllib.request.urlopen(request, timeout=300) as response:
         for raw in response:
             line = raw.decode("utf-8").strip()
@@ -508,7 +542,7 @@ def ask_about_call(settings, transcript_text, history, question, on_text):
     transcript = transcript_text[-COACH_TRANSCRIPT_CHARS:] or "(nothing transcribed yet)"
     messages.append({"role": "user", "content": f"Transcript so far:\n{transcript}\n\nQuestion: {question}"})
     if settings.get("summarizer") == "claude":
-        _stream_claude(COACH_PROMPT, messages, on_text)
+        _stream_claude(COACH_PROMPT, messages, on_text, settings.get("claude_workspace", ""))
     else:
         _stream_local(settings.get("local_model") or DEFAULT_SETTINGS["local_model"], COACH_PROMPT, messages, on_text)
 
@@ -1491,6 +1525,17 @@ class SettingsDialog(QDialog):
         key_row.addWidget(test)
         key_row.addWidget(self.forget)
         key_row.addWidget(get_key)
+        # only for keys that aren't scoped to one workspace (Anthropic then needs anthropic-workspace-id)
+        self.workspace = QLineEdit(store.settings.get("claude_workspace", ""))
+        self.workspace.setPlaceholderText("Only if Test asks for it: wrkspc_...")
+        self.workspace.textChanged.connect(lambda _text: self.key_status.setText(""))
+        find_workspace = QLabel(f'<a href="{CONSOLE_WORKSPACES_URL}">Find it</a>')
+        find_workspace.setOpenExternalLinks(True)
+        find_workspace.setToolTip("Opens the Workspaces page of the Claude Console: copy the ID column of the "
+                                  "workspace to use, then come back here")
+        workspace_row = QHBoxLayout()
+        workspace_row.addWidget(self.workspace, 1)
+        workspace_row.addWidget(find_workspace)
         self.key_status = QLabel("")
         self.key_status.setWordWrap(True)
 
@@ -1500,6 +1545,7 @@ class SettingsDialog(QDialog):
         form.addRow("AI for summaries and Ask", self.summarizer)
         form.addRow("Local model", self.local_model)
         form.addRow("Claude API key", key_row)
+        form.addRow("Workspace ID", workspace_row)
         form.addRow("", self.key_status)
         form.addRow("Screen sharing", self.hide_from_sharing)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
@@ -1524,8 +1570,8 @@ class SettingsDialog(QDialog):
         """Local model for Ollama, the key row for Claude; picking Claude with no key picks one up from the clipboard."""
         engine = self.summarizer.currentData()
         self.form.setRowVisible(2, engine == "local")
-        self.form.setRowVisible(3, engine == "claude")
-        self.form.setRowVisible(4, engine == "claude")
+        for row in (3, 4, 5):   # key, workspace ID, key status
+            self.form.setRowVisible(row, engine == "claude")
         self.forget.setVisible(engine == "claude" and self.has_saved_key)   # setRowVisible re-shows the whole row
         if engine == "claude" and not self.has_saved_key and not self.key.text():
             found = API_KEY_PATTERN.search(QApplication.clipboard().text() or "")
@@ -1546,12 +1592,21 @@ class SettingsDialog(QDialog):
     def changeEvent(self, event):
         # coming back from the browser with a freshly copied key: fill it in without a paste
         super().changeEvent(event)
-        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() and not self.has_saved_key \
-                and self.summarizer.currentData() == "claude" and not self.key.text():
-            found = API_KEY_PATTERN.search(QApplication.clipboard().text() or "")
+        if not (event.type() == QEvent.Type.ActivationChange and self.isActiveWindow()
+                and self.summarizer.currentData() == "claude"):
+            return
+        clipboard = QApplication.clipboard().text() or ""
+        if not self.has_saved_key and not self.key.text():
+            found = API_KEY_PATTERN.search(clipboard)
             if found:
                 self.key.setText(found.group(0))
                 self.set_key_status("Found an Anthropic key on your clipboard and filled it in. Test it, then Save.", None)
+                return
+        if not self.workspace.text():
+            found = WORKSPACE_PATTERN.search(clipboard)
+            if found:
+                self.workspace.setText(found.group(0))
+                self.set_key_status("Found a workspace ID on your clipboard and filled it in. Test it, then Save.", None)
 
     def set_key_status(self, text, ok):
         self.key_status.setText(text)
@@ -1569,10 +1624,11 @@ class SettingsDialog(QDialog):
         QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok, message = check_claude_key(key)
+            ok, message = check_claude_key(key, self.workspace.text().strip())
         finally:
             QApplication.restoreOverrideCursor()
-        self.set_key_status(message + (". Save to use it." if ok and self.key.text() else "."), ok)
+        unsaved = self.key.text() or self.workspace.text().strip() != self.store.settings.get("claude_workspace", "")
+        self.set_key_status(message + (". Save to use it." if ok and unsaved else "." if ok else ""), ok)
 
     def forget_key(self):
         store_claude_key("")
@@ -1590,8 +1646,12 @@ class SettingsDialog(QDialog):
     def save(self):
         if self.summarizer.currentData() == "claude":
             typed = self.key.text().strip()
+            workspace = self.workspace.text().strip()
             if typed and not typed.startswith("sk-ant-"):
                 self.set_key_status("That doesn't look like an Anthropic API key (they start with sk-ant-).", False)
+                return
+            if workspace and not WORKSPACE_PATTERN.fullmatch(workspace):   # check before anything is saved
+                self.set_key_status("That doesn't look like a workspace ID (they start with wrkspc_).", False)
                 return
             if typed:
                 try:
@@ -1602,6 +1662,7 @@ class SettingsDialog(QDialog):
             elif not self.current_key():
                 self.set_key_status("Add a key to use the Claude API, or pick the local model.", False)
                 return
+            self.store.settings["claude_workspace"] = workspace
         self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
         self.store.settings["summarizer"] = self.summarizer.currentData()
         self.store.settings["local_model"] = self.local_model.text().strip() or DEFAULT_SETTINGS["local_model"]
