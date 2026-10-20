@@ -9,13 +9,13 @@
 """heard-ui: a light overlay for heard. macOS, Windows, Linux (one Qt script).
 
 A translucent, always-on-top bar that is excluded from screen sharing, with:
-  - the Listening / Paused switch (capture happens only while this is on)
-  - the live transcript (lines land a few seconds after someone speaks; the sentence in progress is dimmed)
-  - search over the retained history
-  - Save: the transcript as a Markdown file in your notes folder
+  - Start listening / Stop: capture happens only in between. Stop ends the session and writes its transcript
+    as a Markdown log in your notes folder (so does the daemon pausing by itself, or being restarted).
+  - the Live tab: the transcript as it lands (the sentence in progress dimmed), search, Copy, Save
+  - the Logs tab: every session log, with its text, Copy and Show in folder
   - a tray / menu bar icon that shows whether capture is on
 
-Global hotkeys: ⌘⇧H show/hide, ⌘⇧L listening on/off (Ctrl+Shift on Windows). None on Linux.
+Global hotkeys: ⌘⇧H show/hide, ⌘⇧L start/stop (Ctrl+Shift on Windows). None on Linux.
 Everything reads ~/.local/share/heard (heard.db, live.json, paused, daemon.alive); nothing leaves the machine.
 """
 import ctypes
@@ -30,8 +30,8 @@ from pathlib import Path
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QSystemTrayIcon, QTextBrowser,
-                               QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
+                               QStackedWidget, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
@@ -43,8 +43,10 @@ PAUSE_FLAG = DATA_DIRECTORY / "paused"
 LIVE_PATH = DATA_DIRECTORY / "live.json"
 HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"
 CONFIG_PATH = DATA_DIRECTORY / "ui-config.json"
+SESSION_PATH = DATA_DIRECTORY / "session.json"   # the open session's start time, so a log is written even after a crash
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
-BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 760, 46, 360
+BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
+LOG_SUFFIX = " heard.md"
 
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard")}
 
@@ -101,10 +103,20 @@ def stamp(started_at):
     return time.strftime("%H:%M:%S", time.localtime(started_at))
 
 
+def as_text(lines):
+    return "\n".join(f"{stamp(started)} {speaker:>4}: {text}" for _, speaker, text, started in lines)
+
+
+def as_markdown(title, lines):
+    body = "\n".join(f"- {stamp(started)} **{speaker}**: {text}" for _, speaker, text, started in lines)
+    return f"# {title}\n\n{body or '(nothing was transcribed)'}\n"
+
+
 # --- state --------------------------------------------------------------------------------------------
 
 class Store(QObject):
     changed = Signal()          # transcript / live / listening / daemon state
+    logs_changed = Signal()
     status_changed = Signal(str)
 
     def __init__(self):
@@ -114,29 +126,96 @@ class Store(QObject):
         self.lines = []
         self.live = []
         self.listening = False
-        self.listening_since = None
         self.daemon_running = False
         self.search_results = None
         self.newest = time.time() - 3 * 3600
+        self.session_start = self._load_session()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(500)
         self.refresh()
 
+    # sessions
+    @staticmethod
+    def _load_session():
+        try:
+            return float(json.loads(SESSION_PATH.read_text())["started_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def start_listening(self):
+        if not self.daemon_running:
+            self.status_changed.emit("heard-daemon is not running: install it first (macos/install.sh or windows/install.ps1)")
+            return
+        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if self.session_start is None:
+            self.session_start = time.time()
+            SESSION_PATH.write_text(json.dumps({"started_at": self.session_start}))
+            os.chmod(SESSION_PATH, 0o600)
+        PAUSE_FLAG.unlink(missing_ok=True)
+        self.refresh()
+
+    def stop_listening(self):
+        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        PAUSE_FLAG.touch()
+        self.finish_session()
+        self.refresh()
+
+    def toggle_listening(self):
+        if self.listening:
+            self.stop_listening()
+        else:
+            self.start_listening()
+
+    def finish_session(self):
+        """Write the open session's transcript as a log and close the session."""
+        if self.session_start is None:
+            return
+        start, end = self.session_start, time.time()
+        lines = self.transcript.since(start - 1, limit=100000)
+        minutes = max(1, int(round((end - start) / 60)))
+        title = (f"heard session {time.strftime('%Y-%m-%d %H:%M', time.localtime(start))}–"
+                 f"{time.strftime('%H:%M', time.localtime(end))} ({minutes} min, {len(lines)} lines)")
+        path = self.log_folder() / f"{time.strftime('%Y-%m-%d %H.%M', time.localtime(start))}{LOG_SUFFIX}"
+        try:
+            path.write_text(as_markdown(title, lines))
+            os.chmod(path, 0o600)
+            self.status_changed.emit(f"Stopped. Log saved: {path.name}")
+        except OSError as error:
+            self.status_changed.emit(f"Stopped, but could not write the log: {error}")
+        self.session_start = None
+        SESSION_PATH.unlink(missing_ok=True)
+        self.logs_changed.emit()
+
+    def log_folder(self):
+        folder = Path(self.settings["notes_folder"])
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def logs(self):
+        try:
+            files = [p for p in self.log_folder().iterdir() if p.name.endswith(LOG_SUFFIX)]
+        except OSError:
+            return []
+        return sorted(files, key=lambda p: p.name, reverse=True)
+
+    # polling
     def refresh(self):
         fresh = self.transcript.since(self.newest)
         if fresh:
             self.lines.extend(fresh)
             del self.lines[:-600]
             self.newest = fresh[-1][3]
-        listening = not PAUSE_FLAG.exists()
-        if listening and not self.listening:
-            self.listening_since = time.time()
-        self.listening = listening
         try:
             self.daemon_running = time.time() - HEARTBEAT_PATH.stat().st_mtime < 8
         except OSError:
             self.daemon_running = False
+        listening = self.daemon_running and not PAUSE_FLAG.exists()
+        if self.listening and not listening and self.session_start is not None:
+            self.finish_session()   # the daemon paused itself (time limit) or was restarted
+        if not listening and self.session_start is not None and not self.listening:
+            self.finish_session()   # a session left open by an earlier run (crash, reboot)
+        self.listening = listening
         live = []
         try:
             now = time.time()
@@ -148,33 +227,28 @@ class Store(QObject):
         self.live = live
         self.changed.emit()
 
-    def toggle_listening(self):
-        if not self.daemon_running and not self.listening:
-            self.status_changed.emit("heard-daemon is not running: install it first (macos/install.sh or windows/install.ps1)")
-        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        if self.listening:
-            PAUSE_FLAG.touch()
-        else:
-            PAUSE_FLAG.unlink(missing_ok=True)
-        self.refresh()
-
     def search(self, query):
         query = query.strip()
         self.search_results = self.transcript.search(query) if query else None
         self.changed.emit()
 
+    # copy / save
+    def shown_lines(self):
+        return self.search_results if self.search_results is not None else self.lines
+
+    def copy_transcript(self):
+        lines = self.shown_lines()
+        QApplication.clipboard().setText(as_text(lines))
+        self.status_changed.emit(f"Copied {len(lines)} lines to the clipboard")
+
     def save_notes(self):
-        folder = Path(self.settings["notes_folder"])
-        folder.mkdir(parents=True, exist_ok=True)
         now = time.strftime("%Y-%m-%d %H.%M")
-        path = folder / f"{now} heard.md"
-        shown = self.search_results if self.search_results is not None else self.lines
-        text = f"# heard transcript, {now}\n\n" + "\n".join(
-            f"- {stamp(started)} **{speaker}**: {line}" for _, speaker, line, started in shown) + "\n"
+        path = self.log_folder() / f"{now} saved{LOG_SUFFIX}"
         try:
-            path.write_text(text)
+            path.write_text(as_markdown(f"heard transcript, saved {now}", self.shown_lines()))
             os.chmod(path, 0o600)
-            self.status_changed.emit(f"Saved {path.name} in {folder}")
+            self.status_changed.emit(f"Saved {path.name}")
+            self.logs_changed.emit()
             reveal(path)
         except OSError as error:
             self.status_changed.emit(f"Could not save: {error}")
@@ -286,9 +360,16 @@ QPushButton#switch[state="paused"]:hover { background: #ffc94d; }
 QPushButton#switch[state="listening"] { background: #e03a30; color: #ffffff; }
 QPushButton#switch[state="listening"]:hover { background: #f04c42; }
 QPushButton#switch[state="off"] { background: rgba(255,255,255,0.09); color: #8a8a8a; }
+QPushButton#tab { background: transparent; color: #9c9c9c; padding: 5px 9px; }
+QPushButton#tab[active="true"] { background: rgba(255,255,255,0.14); color: #ffffff; font-weight: 600; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
 QTextBrowser { background: transparent; border: none; }
+QListWidget { background: rgba(255,255,255,0.05); border: none; border-radius: 8px; padding: 4px; outline: none; }
+QListWidget::item { padding: 5px 6px; border-radius: 6px; }
+QListWidget::item:selected { background: rgba(255,255,255,0.16); color: #ffffff; }
+QListWidget::item:hover { background: rgba(255,255,255,0.09); }
 QLabel#status { color: #9c9c9c; font-size: 10px; }
+QLabel#hint { color: #8a8a8a; }
 QScrollBar:vertical { background: transparent; width: 8px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,0.18); border-radius: 4px; min-height: 20px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -307,6 +388,148 @@ def pill(text, slot, name=None, tooltip=None):
     return button
 
 
+def repolish(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+class LivePane(QWidget):
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.view = QTextBrowser()
+        self.view.setOpenLinks(False)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.view)
+        self.setLayout(layout)
+        self._last_html = None
+        store.changed.connect(self.render)
+
+    def render(self):
+        store = self.store
+        shown = store.shown_lines()
+        parts = []
+        if not shown:
+            if store.search_results is not None:
+                parts.append('<p style="color:#8a8a8a">No matches.</p>')
+            elif store.listening:
+                parts.append('<p style="color:#8a8a8a">Listening. Lines appear a few seconds after someone speaks.</p>')
+            else:
+                parts.append('<p style="color:#8a8a8a">Not listening. Press Start listening before a call; Stop ends it '
+                             'and keeps a log in the Logs tab.</p>')
+        for _, speaker, text, started in shown:
+            color = "#5aa0ff" if speaker == "me" else "#f0a44a"
+            parts.append(f'<div style="margin:0 0 3px 0"><span style="color:#6f6f6f;font-family:Menlo,Consolas,monospace;'
+                         f'font-size:10px">{stamp(started)}</span>&nbsp; <b style="color:{color}">{speaker}</b>&nbsp; '
+                         f'{escape(text)}</div>')
+        if store.search_results is None:
+            for speaker, text in store.live:
+                parts.append(f'<div style="color:#8a8a8a;margin:0 0 3px 0"><i>… {speaker}: {escape(text)}</i></div>')
+        bar = self.view.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        html = "".join(parts)
+        if html != self._last_html:
+            self._last_html = html
+            self.view.setHtml(html)
+            if at_bottom or store.search_results is not None:
+                bar.setValue(bar.maximum())
+
+
+class LogsPane(QWidget):
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.list = QListWidget()
+        self.list.setFixedWidth(250)
+        self.list.setFocusPolicy(Qt.NoFocus)
+        self.list.currentItemChanged.connect(lambda current, _previous: self.show_log(current))
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        self.copy_button = pill("Copy log", self.copy_log, tooltip="Copy this log as text")
+        self.reveal_button = pill("Show in folder", self.reveal_log)
+        self.delete_button = pill("Delete", self.delete_log, tooltip="Move this log to the Trash / delete it")
+        tools = QHBoxLayout()
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.addWidget(self.copy_button)
+        tools.addWidget(self.reveal_button)
+        tools.addStretch(1)
+        tools.addWidget(self.delete_button)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)
+        right.addWidget(self.view, 1)
+        right.addLayout(tools)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(self.list)
+        layout.addLayout(right, 1)
+        self.setLayout(layout)
+        store.logs_changed.connect(self.reload)
+        self.reload()
+
+    def reload(self):
+        current = self.current_path()
+        self.list.clear()
+        for path in self.store.logs():
+            item = QListWidgetItem(path.name[:-len(LOG_SUFFIX)])
+            item.setData(Qt.UserRole, str(path))
+            item.setToolTip(str(path))
+            self.list.addItem(item)
+        if self.list.count() == 0:
+            self.view.setHtml('<p style="color:#8a8a8a">No logs yet. Each Stop (and each Save) writes one here.</p>')
+            return
+        for index in range(self.list.count()):
+            if current and self.list.item(index).data(Qt.UserRole) == current:
+                self.list.setCurrentRow(index)
+                return
+        self.list.setCurrentRow(0)
+
+    def current_path(self):
+        item = self.list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def show_log(self, item):
+        if not item:
+            return
+        try:
+            text = Path(item.data(Qt.UserRole)).read_text()
+            if text.startswith("# "):
+                text = "#### " + text[2:]   # the title line, at a size that fits the pane
+            self.view.setMarkdown(text)
+        except OSError as error:
+            self.view.setPlainText(f"Could not read the log: {error}")
+
+    def copy_log(self):
+        path = self.current_path()
+        if path:
+            QApplication.clipboard().setText(Path(path).read_text())
+            self.store.status_changed.emit(f"Copied {Path(path).name} to the clipboard")
+
+    def reveal_log(self):
+        path = self.current_path()
+        if path:
+            reveal(Path(path))
+
+    def delete_log(self):
+        path = self.current_path()
+        if not path:
+            return
+        try:
+            if IS_MAC:
+                subprocess.run(["osascript", "-e", f'tell application "Finder" to delete POSIX file "{path}"'],
+                               capture_output=True, timeout=10)
+                if Path(path).exists():
+                    Path(path).unlink()
+            else:
+                Path(path).unlink()
+            self.store.status_changed.emit(f"Deleted {Path(path).name}")
+        except (OSError, subprocess.SubprocessError) as error:
+            self.store.status_changed.emit(f"Could not delete: {error}")
+        self.reload()
+
+
 class Overlay(QWidget):
     def __init__(self, store, hide_me, open_settings):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -317,18 +540,18 @@ class Overlay(QWidget):
         self.setStyleSheet(STYLE)
         self.expanded = True
         self.drag_offset = None
-
-        self.listen_button = pill("", store.toggle_listening, "switch", f"Start / stop capturing ({MOD}L)")
         self.blink_on = True
-        self.blink = QTimer(self)
-        self.blink.timeout.connect(self.toggle_blink)
-        self.blink.start(700)
+
+        self.switch = pill("", store.toggle_listening, "switch", f"Start / stop capturing ({MOD}L)")
+        self.live_tab = pill("Live", lambda: self.show_tab(0), "tab")
+        self.logs_tab = pill("Logs", lambda: self.show_tab(1), "tab")
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search the retained history…  (Enter; clear to go back live)")
+        self.search.setPlaceholderText("Search…  (Enter; clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.search.textChanged.connect(lambda text: store.search("") if not text else None)
-        self.save_button = pill("Save", store.save_notes, tooltip="Save what is shown as a Markdown file")
+        self.copy_button = pill("Copy", store.copy_transcript, tooltip="Copy the whole transcript shown")
+        self.save_button = pill("Save", store.save_notes, tooltip="Save what is shown as a log, without stopping")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
         self.settings_button = pill("⚙", open_settings, "icon", "Settings")
         self.hide_button = pill("✕", hide_me, "icon", f"Hide ({MOD}H)")
@@ -336,23 +559,33 @@ class Overlay(QWidget):
         bar = QHBoxLayout()
         bar.setContentsMargins(12, 0, 8, 0)
         bar.setSpacing(8)
-        for widget in (self.listen_button, self.search, self.save_button, self.expand_button,
+        tabs = QHBoxLayout()
+        tabs.setContentsMargins(0, 0, 0, 0)
+        tabs.setSpacing(2)
+        tabs.addWidget(self.live_tab)
+        tabs.addWidget(self.logs_tab)
+        bar.addWidget(self.switch)
+        bar.addLayout(tabs)
+        for widget in (self.search, self.copy_button, self.save_button, self.expand_button,
                        self.settings_button, self.hide_button):
             bar.addWidget(widget)
         bar_widget = QWidget()
         bar_widget.setLayout(bar)
         bar_widget.setFixedHeight(BAR_HEIGHT)
 
-        self.transcript_view = QTextBrowser()
-        self.transcript_view.setOpenLinks(False)
+        self.stack = QStackedWidget()
+        self.live_pane = LivePane(store)
+        self.logs_pane = LogsPane(store)
+        self.stack.addWidget(self.live_pane)
+        self.stack.addWidget(self.logs_pane)
         self.status = QLabel("")
         self.status.setObjectName("status")
-        self.status.setContentsMargins(14, 0, 14, 6)
+        self.status.setContentsMargins(2, 0, 2, 6)
         self.pane = QWidget()
         pane_layout = QVBoxLayout()
         pane_layout.setContentsMargins(12, 6, 12, 0)
-        pane_layout.setSpacing(0)
-        pane_layout.addWidget(self.transcript_view, 1)
+        pane_layout.setSpacing(4)
+        pane_layout.addWidget(self.stack, 1)
         pane_layout.addWidget(self.status)
         self.pane.setLayout(pane_layout)
 
@@ -364,16 +597,20 @@ class Overlay(QWidget):
         self.setLayout(root)
 
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=hide_me)
-        store.changed.connect(self.render_state)
+        store.changed.connect(self.render_switch)
         store.status_changed.connect(self.status.setText)
-        self.render_state()
+        self.blink = QTimer(self)
+        self.blink.timeout.connect(self.toggle_blink)
+        self.blink.start(700)
+        self.show_tab(0)
+        self.render_switch()
         self.apply_size()
 
     # window chrome
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        listening = self.store.listening and self.store.daemon_running
+        listening = self.store.listening
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setBrush(QColor(20, 20, 25, 232))
         pen = QPen(QColor(224, 58, 48, 220 if self.blink_on else 120) if listening else QColor(255, 255, 255, 36))
@@ -382,7 +619,7 @@ class Overlay(QWidget):
         painter.drawRoundedRect(rect, 15, 15)
 
     def toggle_blink(self):
-        if self.store.listening and self.store.daemon_running:
+        if self.store.listening:
             self.blink_on = not self.blink_on
             self.render_switch()
             self.update()
@@ -414,53 +651,32 @@ class Overlay(QWidget):
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(QPoint(screen.center().x() - BAR_WIDTH // 2, screen.top() + 10))
 
+    def show_tab(self, index):
+        self.stack.setCurrentIndex(index)
+        for i, tab in enumerate((self.live_tab, self.logs_tab)):
+            tab.setProperty("active", "true" if i == index else "false")
+            repolish(tab)
+        if index == 1:
+            self.logs_pane.reload()
+        if not self.expanded:
+            self.toggle_expanded()
+
     # rendering
     def render_switch(self):
         store = self.store
         if not store.daemon_running:
             state, label = "off", "○  Daemon off"
         elif store.listening:
-            minutes = int((time.time() - (store.listening_since or time.time())) / 60)
+            minutes = int((time.time() - (store.session_start or time.time())) / 60)
             dot = "●" if self.blink_on else "○"
             state, label = "listening", f"{dot}  Listening · {minutes} min  ·  Stop" if minutes else f"{dot}  Listening  ·  Stop"
         else:
-            state, label = "paused", "▶  Paused  ·  Start listening"
-        self.listen_button.setText(f"{label}   {MOD}L")
-        if self.listen_button.property("state") != state:
-            self.listen_button.setProperty("state", state)
-            self.listen_button.style().unpolish(self.listen_button)
-            self.listen_button.style().polish(self.listen_button)
+            state, label = "paused", "▶  Start listening"
+        self.switch.setText(f"{label}   {MOD}L")
+        if self.switch.property("state") != state:
+            self.switch.setProperty("state", state)
+            repolish(self.switch)
             self.update()
-
-    def render_state(self):
-        store = self.store
-        self.render_switch()
-
-        shown = store.search_results if store.search_results is not None else store.lines
-        parts = []
-        if not shown:
-            if store.search_results is not None:
-                parts.append('<p style="color:#8a8a8a">No matches.</p>')
-            elif store.listening:
-                parts.append('<p style="color:#8a8a8a">Listening. Lines appear a few seconds after someone speaks.</p>')
-            else:
-                parts.append('<p style="color:#8a8a8a">Paused. Nothing is captured until you turn Listening on.</p>')
-        for _, speaker, text, started in shown:
-            color = "#5aa0ff" if speaker == "me" else "#f0a44a"
-            parts.append(f'<div style="margin:0 0 3px 0"><span style="color:#6f6f6f;font-family:Menlo,Consolas,monospace;'
-                         f'font-size:10px">{stamp(started)}</span>&nbsp; <b style="color:{color}">{speaker}</b>&nbsp; '
-                         f'{escape(text)}</div>')
-        if store.search_results is None:
-            for speaker, text in store.live:
-                parts.append(f'<div style="color:#8a8a8a;margin:0 0 3px 0"><i>… {speaker}: {escape(text)}</i></div>')
-        bar = self.transcript_view.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - 4
-        html = "".join(parts)
-        if html != getattr(self, "_last_html", None):
-            self._last_html = html
-            self.transcript_view.setHtml(html)
-            if at_bottom or store.search_results is not None:
-                bar.setValue(bar.maximum())
 
 
 def escape(text):
@@ -480,9 +696,10 @@ class SettingsDialog(QDialog):
         folder_row.addWidget(self.folder)
         folder_row.addWidget(browse)
         form = QFormLayout()
-        form.addRow("Notes folder (Save writes here)", folder_row)
-        note = QLabel(f"The transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is deleted "
-                      "after a few days. Nothing leaves the machine.")
+        form.addRow("Logs folder (Stop and Save write here)", folder_row)
+        note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
+                      "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
+                      "the machine.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", note)
@@ -493,16 +710,17 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
-        self.resize(480, 150)
+        self.resize(520, 160)
 
     def choose_folder(self):
-        chosen = QFileDialog.getExistingDirectory(self, "Notes folder", self.folder.text())
+        chosen = QFileDialog.getExistingDirectory(self, "Logs folder", self.folder.text())
         if chosen:
             self.folder.setText(chosen)
 
     def save(self):
         self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
         save_settings(self.store.settings)
+        self.store.logs_changed.emit()
         self.accept()
 
 
@@ -572,10 +790,10 @@ def main():
     tray = QSystemTrayIcon(tray_icon(store.listening))
     menu = QMenu()
     menu.addAction(QAction(f"Show / hide overlay\t{MOD}H", menu, triggered=toggle_visible))
-    menu.addAction(QAction(f"Listening on / off\t{MOD}L", menu, triggered=store.toggle_listening))
+    menu.addAction(QAction(f"Start / stop listening\t{MOD}L", menu, triggered=store.toggle_listening))
     menu.addSeparator()
-    menu.addAction(QAction("Open notes folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
-    menu.addAction(QAction("Open transcript folder", menu, triggered=lambda: open_folder(DATA_DIRECTORY)))
+    menu.addAction(QAction("Logs", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
+    menu.addAction(QAction("Open logs folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
     menu.addAction(QAction("Settings…", menu, triggered=open_settings))
     menu.addSeparator()
     menu.addAction(QAction("Quit Heard", menu, triggered=app.quit))
@@ -593,6 +811,8 @@ def main():
 
     if os.environ.get("HEARD_UI_SCREENSHOT"):   # development: grab the window and exit
         def shoot():
+            if os.environ.get("HEARD_UI_TAB") == "logs":
+                overlay.show_tab(1)
             overlay.grab().save(os.environ["HEARD_UI_SCREENSHOT"])
             app.quit()
         QTimer.singleShot(int(os.environ.get("HEARD_UI_SCREENSHOT_DELAY", "3000")), shoot)

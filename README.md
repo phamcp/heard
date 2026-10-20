@@ -12,8 +12,9 @@ $ heard "staging rollout"
 $ heard -f          # follow live, with an in-progress line for whoever is talking right now
 ```
 
-Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from screen sharing, with the
-Listening switch, the live transcript, search, and Save.
+Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from screen sharing. Start listening
+before a call, Stop after it: each session becomes a Markdown log you can read, copy and search later in the
+overlay's Logs tab.
 
 - **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records the system's default output, not
   a particular app.
@@ -109,12 +110,18 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 
 | Control | |
 |---|---|
-| **● Listening / Paused** (⌘⇧L, Ctrl+Shift+L) | the switch; red while capturing, with the minutes so far |
-| search field | search the retained history (Enter); clear it to go back to the live view |
-| **Save** | what is shown, as a Markdown file in your notes folder (`~/Documents/heard`), revealed in Finder / Explorer |
-| transcript pane | lines as they land, the sentence in progress dimmed |
-| ⚙ | the notes folder |
+| **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | opens a session; amber while off |
+| **● Listening · Stop** (same key) | red, blinking, with the minutes so far; Stop ends the session and writes its transcript as a log |
+| **Live** tab | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
+| **Logs** tab | every session log (and every Save) in your logs folder (`~/Documents/heard`): read, Copy, Show in folder, Delete |
+| **Copy** | the whole transcript shown, as text, to the clipboard |
+| **Save** | what is shown as a log, without stopping |
+| ⚙ | the logs folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
+
+A session also closes, with its log, when the daemon pauses itself after the time limit or is restarted, and on
+the next overlay start if the overlay itself was quit mid-session. Logs are kept until you delete them; the
+rolling transcript database behind them still expires after 3 days.
 
 ### The command line
 
