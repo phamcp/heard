@@ -12,9 +12,9 @@ A translucent, always-on-top bar that is excluded from screen sharing, with:
   - Start listening / Stop: capture happens only in between. Stop ends the session and writes its transcript
     as a Markdown log in your notes folder (so does the daemon pausing by itself, or being restarted).
   - the transcript as it lands (the sentence in progress dimmed), search, Copy; Log writes what is shown to a
-    log and clears the view. Each log gets a title made from the transcript's own most prominent phrases
+    log and clears the view (Log call). Each log gets a title made from the transcript's own most prominent phrases
     (local keyword extraction; nothing is sent anywhere).
-  - Logs: every log, with its text, Copy and Show in folder
+  - Library: every logged call, with its text, Copy and Show in folder
   - a tray / menu bar icon that shows whether capture is on
 
 Global hotkeys: ⌘⇧H show/hide, ⌘⇧L start/stop (Ctrl+Shift on Windows). None on Linux.
@@ -501,7 +501,7 @@ class LivePane(QWidget):
                 parts.append('<p style="color:#8a8a8a">Listening. Lines appear a few seconds after someone speaks.</p>')
             else:
                 parts.append('<p style="color:#8a8a8a">Not listening. Press Start listening before a call; Stop ends it '
-                             'and keeps a log under Logs.</p>')
+                             'and files it in the Library.</p>')
         for _, speaker, text, started in shown:
             color = "#5aa0ff" if speaker == "me" else "#f0a44a"
             parts.append(f'<div style="margin:0 0 3px 0"><span style="color:#6f6f6f;font-family:Menlo,Consolas,monospace;'
@@ -565,7 +565,7 @@ class LogsPane(QWidget):
             item.setToolTip(str(path))
             self.list.addItem(item)
         if self.list.count() == 0:
-            self.view.setHtml('<p style="color:#8a8a8a">No logs yet. Each Stop (and each Log) writes one here.</p>')
+            self.view.setHtml('<p style="color:#8a8a8a">Nothing in the library yet. Each Stop (and each Log call) files one here.</p>')
             return
         for index in range(self.list.count()):
             if current and self.list.item(index).data(Qt.UserRole) == current:
@@ -630,14 +630,14 @@ class Overlay(QWidget):
         self.blink_on = True
 
         self.switch = pill("", store.toggle_listening, "switch", f"Start / stop capturing ({MOD}L)")
-        self.logs_tab = pill("Logs", self.toggle_logs, "tab", "Show the logs; click again for the live transcript")
+        self.logs_tab = pill("Library", self.toggle_logs, "tab", "Show the library of logged calls; click again for the live transcript")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search…  (Enter; clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.search.textChanged.connect(lambda text: store.search("") if not text else None)
         self.copy_button = pill("Copy", store.copy_transcript, tooltip="Copy the whole transcript shown")
-        self.log_button = pill("Log", store.log_and_clear, tooltip="Write what is shown to a log and clear the view")
+        self.log_button = pill("Log call", store.log_and_clear, tooltip="File what is shown in the library and clear the view")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
         self.settings_button = pill("⚙", open_settings, "icon", "Settings")
         self.hide_button = pill("✕", hide_me, "icon", f"Hide ({MOD}H)")
@@ -779,7 +779,7 @@ class SettingsDialog(QDialog):
         folder_row.addWidget(self.folder)
         folder_row.addWidget(browse)
         form = QFormLayout()
-        form.addRow("Logs folder (Stop and Save write here)", folder_row)
+        form.addRow("Library folder (Stop and Log call write here)", folder_row)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
                       "the machine.")
@@ -796,7 +796,7 @@ class SettingsDialog(QDialog):
         self.resize(520, 160)
 
     def choose_folder(self):
-        chosen = QFileDialog.getExistingDirectory(self, "Logs folder", self.folder.text())
+        chosen = QFileDialog.getExistingDirectory(self, "Library folder", self.folder.text())
         if chosen:
             self.folder.setText(chosen)
 
@@ -875,8 +875,8 @@ def main():
     menu.addAction(QAction(f"Show / hide overlay\t{MOD}H", menu, triggered=toggle_visible))
     menu.addAction(QAction(f"Start / stop listening\t{MOD}L", menu, triggered=store.toggle_listening))
     menu.addSeparator()
-    menu.addAction(QAction("Logs", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
-    menu.addAction(QAction("Open logs folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
+    menu.addAction(QAction("Library", menu, triggered=lambda: (overlay.show(), overlay.show_tab(1))))
+    menu.addAction(QAction("Open library folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
     menu.addAction(QAction("Settings…", menu, triggered=open_settings))
     menu.addSeparator()
     menu.addAction(QAction("Quit Heard", menu, triggered=app.quit))

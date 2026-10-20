@@ -14,7 +14,7 @@ $ heard -f          # follow live, with an in-progress line for whoever is talki
 
 Or use the overlay, `heard-ui`: a translucent always-on-top bar, hidden from screen sharing. Start listening
 before a call, Stop after it: each session becomes a Markdown log you can read, copy and search later in the
-overlay's Logs tab.
+overlay's Library.
 
 - **Any app:** Zoom, Slack huddles, Google Meet, a browser video. It records the system's default output, not
   a particular app.
@@ -113,10 +113,10 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **▶ Start listening** (⌘⇧L, Ctrl+Shift+L) | opens a session; amber while off |
 | **● Listening · Stop** (same key) | red, blinking, with the minutes so far; Stop ends the session, writes its transcript as a log and clears the view |
 | transcript | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
-| **Logs** | toggles the log list: every log in your logs folder (`~/Documents/heard`) with its text, Copy log, Show in folder, Delete |
+| **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Delete |
 | **Copy** | the whole transcript shown, as text, to the clipboard |
-| **Log** | writes what is shown to a log and clears the view, without stopping |
-| ⚙ | the logs folder |
+| **Log call** | files what is shown in the library and clears the view, without stopping |
+| ⚙ | the library folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
 Each log is titled from the transcript's own words (its most prominent phrases, e.g. "staging rollout, IAM
