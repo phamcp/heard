@@ -163,13 +163,18 @@ def windows_tap(arguments):
     what = arguments[0] if arguments else ""
     wanted = arguments[1] if len(arguments) > 1 and arguments[1] else ""
     if what == "default-output":
-        print(loopback_of(audio.get_default_wasapi_device(d_out=True))["name"])
+        # "them" listens to every output at once, so the answer is the set of outputs: when a device
+        # appears or disappears (headphones plugged in, a monitor woken up) the capture restarts with it
+        names = sorted(device["name"].removesuffix(" [Loopback]") for device in audio.get_loopback_device_info_generator())
+        print(ALL_OUTPUTS + "; ".join(names))
         return 0
     if what == "default-input":
         print(audio.get_default_wasapi_device(d_in=True)["name"])
         return 0
+    if what == "them" and (not wanted or wanted.startswith(ALL_OUTPUTS)):
+        return windows_tap_all_outputs(audio, pyaudio)
     if what == "them":
-        device = by_name(wanted) if wanted else loopback_of(audio.get_default_wasapi_device(d_out=True))
+        device = by_name(wanted)
     elif what == "me":
         device = by_name(wanted) if wanted else audio.get_default_wasapi_device(d_in=True)
     else:
@@ -194,6 +199,87 @@ def windows_tap(arguments):
         return 0
     finally:
         stream.close()
+        audio.terminate()
+
+
+ALL_OUTPUTS = "all outputs: "
+
+
+def windows_tap_all_outputs(audio, pyaudio):
+    """"them" on Windows by default: the loopback of every output device, mixed into one stream.
+
+    Apps can send sound to any output (Zoom's own speaker setting, a browser tab on the monitor's
+    speakers), not only the Windows default, so listen to all of them. Each device is read in its own
+    thread into a 16 kHz buffer; the mixer writes one 30 ms frame on a steady clock, adding whatever
+    each device has and silence for the rest. A silent loopback delivers no data at all, so this also
+    keeps the stream flowing (and utterances closing) when nothing is playing."""
+    import collections
+    import threading
+
+    frame = int(SAMPLE_RATE * FRAME_SECONDS)
+    max_buffered = SAMPLE_RATE // 2   # more than 0.5 s queued means drift or a burst: drop the oldest
+    buffers, primed, lock = {}, set(), threading.Lock()
+
+    def read(device):
+        rate = int(device["defaultSampleRate"])
+        channels = max(1, int(device["maxInputChannels"]))
+        block = int(rate * FRAME_SECONDS)
+        try:
+            stream = audio.open(format=pyaudio.paFloat32, channels=channels, rate=rate, input=True,
+                                input_device_index=device["index"], frames_per_buffer=block)
+        except OSError as error:
+            print(f"skipping {device['name']}: {error}", file=sys.stderr, flush=True)
+            return
+        buffer = collections.deque()
+        with lock:
+            buffers[device["index"]] = buffer
+        try:
+            while True:
+                frames = numpy.frombuffer(stream.read(block, exception_on_overflow=False), dtype=numpy.float32)
+                mono = frames.reshape(-1, channels).mean(axis=1) if channels > 1 else frames
+                with lock:
+                    buffer.extend(resample_to_16k(mono, rate).tolist())
+                    while len(buffer) > max_buffered:
+                        buffer.popleft()
+        except OSError as error:   # unplugged: the daemon's device check restarts us with the new set
+            print(f"{device['name']} stopped: {error}", file=sys.stderr, flush=True)
+            with lock:
+                buffers.pop(device["index"], None)
+
+    devices = list(audio.get_loopback_device_info_generator())
+    if not devices:
+        sys.exit("no output devices to listen to")
+    for device in devices:
+        threading.Thread(target=read, args=(device,), daemon=True).start()
+    print("capturing them: all outputs: " + ", ".join(device["name"] for device in devices), file=sys.stderr, flush=True)
+
+    out = sys.stdout.buffer
+    next_tick = time.monotonic()
+    try:
+        while True:
+            next_tick += FRAME_SECONDS
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+            mixed = numpy.zeros(frame, dtype=numpy.float32)
+            with lock:
+                for index, buffer in buffers.items():
+                    # a small jitter buffer: start draining a device only once ~90 ms is queued, so a
+                    # block that arrives a moment late doesn't punch a silent hole into speech
+                    if index not in primed and len(buffer) >= frame * 3:
+                        primed.add(index)
+                    if index not in primed:
+                        continue
+                    take = min(frame, len(buffer))
+                    if take:
+                        mixed[:take] += numpy.fromiter((buffer.popleft() for _ in range(take)), numpy.float32, take)
+                    if not buffer:
+                        primed.discard(index)   # the output went quiet: prime again when sound returns
+            out.write((numpy.clip(mixed, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+            out.flush()
+            if time.monotonic() - next_tick > 1.0:   # fell behind (sleep, a stall): resync, don't race
+                next_tick = time.monotonic()
+    except (BrokenPipeError, OSError):
+        return 0
+    finally:
         audio.terminate()
 
 

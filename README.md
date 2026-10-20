@@ -27,7 +27,9 @@ later in the overlay's Library.
   - Linux: `parec` on the output's monitor source and on the microphone (PulseAudio or PipeWire)
   - macOS: a [Core Audio process tap](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
     on the default output (macOS 14.2+), and the default input device
-  - Windows: the WASAPI loopback of the default output, and the default microphone
+  - Windows: the WASAPI loopback of every output device, mixed, so it keeps hearing the call when an app
+    sends sound somewhere other than the Windows default (Zoom's own speaker setting, a monitor's speakers);
+    and the default microphone
 
 This fork adds the macOS and Windows ports, the overlay, and conservative defaults to
 [ZachGoldberg/heard](https://github.com/ZachGoldberg/heard).
