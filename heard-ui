@@ -205,6 +205,7 @@ class Store(QObject):
         self.listening = False
         self.daemon_running = False
         self.search_results = None
+        self.last_log_path = None     # the log Stop recording just wrote; the Library opens on it
         self.session_start = self._load_session()
         # show the current call from its start, else the last three hours, but never what Stop recording cleared
         self.newest = (self.session_start - 1) if self.session_start else max(
@@ -276,6 +277,7 @@ class Store(QObject):
         try:
             path.write_text(as_markdown(f"{topic}\n\n_{detail}_", lines))
             os.chmod(path, 0o600)
+            self.last_log_path = str(path)
             self.status_changed.emit(f"{verb}. Log saved: {topic}")
         except OSError as error:
             self.status_changed.emit(f"{verb}, but could not write the log: {error}")
@@ -569,7 +571,8 @@ class LogsPane(QWidget):
         self.reload()
 
     def reload(self):
-        current = self.current_path()
+        current = self.store.last_log_path or self.current_path()   # a just-written log wins over the old selection
+        self.store.last_log_path = None
         self.list.clear()
         for path in self.store.logs():
             name = path.name[:-len(LOG_SUFFIX)]
