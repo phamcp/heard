@@ -36,7 +36,8 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 
 - **Off until you say so.** The daemon starts paused, at every boot and every restart. Capture runs only after
   you turn Listening on (the overlay, its hotkey, or `heard resume`), and the overlay's dot and tray icon are
-  red the whole time it does.
+  red the whole time it does. While paused, no capture process runs at all, so the system's microphone
+  indicator (macOS menu bar, Windows taskbar) is off too.
 - **Pauses itself** after 3 hours of continuous listening (`HEARD_MAX_LISTEN_MINUTES`), so a switch left on
   does not quietly transcribe the rest of the day.
 - **Short memory.** Lines older than 3 days are deleted (`HEARD_RETENTION_DAYS`). Audio is never stored.
@@ -49,8 +50,9 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/). `heard-daemon` and `heard-ui` are uv scripts and install their own
-  dependencies on the first run (faster-whisper, numpy; PySide6 for the overlay; on Linux and Windows also
-  NVIDIA's pip-packaged cuBLAS/cuDNN; on Windows sounddevice).
+  dependencies on the first run (faster-whisper, numpy; PySide6-Essentials for the overlay; on Linux and Windows
+  also NVIDIA's pip-packaged cuBLAS/cuDNN, about 1.5 GB, downloaded even without an NVIDIA GPU; on Windows
+  PyAudioWPatch, a PortAudio build with WASAPI loopback).
 - Optional: an NVIDIA GPU (Linux, Windows). The default model is `large-v3-turbo` on CUDA. Without a usable
   GPU it falls back to `small.en` on the CPU automatically. macOS always uses the CPU (`small.en` by default;
   set `HEARD_MODEL` to try a bigger one on Apple silicon).
@@ -58,7 +60,8 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
   for running it in the background)
 - macOS: 14.2 or newer, and the Xcode Command Line Tools (`xcode-select --install`) to build the small
   `heard-tap` helper
-- Windows: 10 or 11
+- Windows: 10 or 11 (version 2004 or newer hides the overlay from screen sharing), and
+  [uv](https://docs.astral.sh/uv/) (`winget install astral-sh.uv`) and git
 
 ## Install
 
@@ -92,15 +95,25 @@ and `… local.heard-ui` stop and uninstall the agents. `macos/install.sh --no-a
 
 ### Windows
 
+In PowerShell (no administrator needed):
+
 ```powershell
 git clone https://github.com/phamcp/heard
-powershell -ExecutionPolicy Bypass -File heard\windows\install.ps1   # installs to %USERPROFILE%\.local\bin, registers logon tasks
-Get-Content -Wait $env:USERPROFILE\.local\share\heard\heard-daemon.log   # first start downloads the model
+powershell -ExecutionPolicy Bypass -File heard\windows\install.ps1
+Get-Content -Wait $env:USERPROFILE\.local\share\heard\heard-daemon.log   # first start downloads packages and the model
 ```
 
-The tasks "heard" (daemon) and "heard-ui" (overlay) start hidden at logon; `Stop-ScheduledTask heard` and
-`Start-ScheduledTask heard` control the daemon, `Unregister-ScheduledTask` removes them. `windows\install.ps1
--NoTask` only installs the files; then `uv run --script heard-daemon` runs it in a terminal.
+The installer copies the scripts to `%USERPROFILE%\.local\bin` (and adds it to your PATH for the `heard`
+command), then starts the daemon (paused) and the overlay, and again at every logon: as the Scheduled Tasks
+"heard" and "heard-ui", or as Startup-folder shortcuts if Task Scheduler refuses. The first start takes a few
+minutes while uv downloads Python, the packages and the speech model; the overlay shows "Daemon off" until the
+daemon is up. Windows may ask once to allow microphone access for Python.
+
+- **Update:** `git pull`, then run the installer again. It stops the running copy first.
+- **Uninstall:** run the installer with `-Uninstall`. Transcripts and call logs are kept.
+- **Files only:** `-NoTask` installs without starting anything; then `uv run --script heard-daemon` runs it in a
+  terminal.
+- **Logs:** `heard-daemon.log` and `heard-ui.log` in `%USERPROFILE%\.local\share\heard`.
 
 ## Usage
 
@@ -144,19 +157,20 @@ with voice-activity filtering and stored. While someone is still talking, the ut
 about once a second into `live.json`, so `heard -f` and the overlay can show live captions.
 
 The capture processes are `parec` on Linux, `heard-tap` on macOS (`macos/heard-tap.swift`, ~300 lines of Swift
-over Core Audio) and the daemon itself in `tap` mode on Windows (sounddevice / PortAudio). Each one writes raw
-PCM to its stdout; the daemon re-checks the default output every few seconds and restarts the capture when you
-switch between speakers and headphones. While paused, the audio is read and discarded; nothing is buffered.
+over Core Audio) and the daemon itself in `tap` mode on Windows (PyAudioWPatch, whose PortAudio build exposes
+a loopback input for every output device). Each one writes raw PCM to its stdout. A watcher beside each capture
+re-checks the default device every few seconds (ten on Windows) and restarts the capture when you switch between
+speakers and headphones, and ends it the moment Listening is turned off. While paused, nothing runs.
 
-`heard-ui` is one PySide6 (Qt) script for all three platforms. It polls the database, `live.json`, the pause
+`heard-ui` is one PySide6 (Qt) script for all three platforms, and runs once per user (a second start exits). It polls the database, `live.json`, the pause
 flag and the daemon's heartbeat file; the only platform-specific parts are the floating non-activating window,
 the global hotkeys (Carbon on macOS, `RegisterHotKey` on Windows) and the screen-capture exclusion
 (`NSWindow.sharingType` on macOS, `SetWindowDisplayAffinity` on Windows).
 
 On Linux the daemon holds a systemd-logind *delay* inhibitor and exits just before suspend. systemd restarts it
 after resume with a fresh CUDA context. Keeping a CUDA context across suspend/resume once faulted the NVIDIA
-driver into "reboot required". On macOS and Windows the capture process exits when its device goes quiet
-(sleep, an unplugged headset) and is restarted on whatever the default device is then.
+driver into "reboot required". On macOS and Windows a capture process that fails (sleep, an unplugged headset)
+is restarted on whatever the default device is then. Only one daemon runs per user: a second one exits.
 
 Environment overrides: `HEARD_MODEL`, `HEARD_CPU_MODEL`, `HEARD_CPU_THREADS`, `HEARD_RETENTION_DAYS`,
 `HEARD_MAX_LISTEN_MINUTES`, `HEARD_START_LISTENING` (capture from boot instead of starting paused),

@@ -6,7 +6,7 @@
 #   "numpy",
 #   "nvidia-cublas-cu12; sys_platform != 'darwin'",
 #   "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
-#   "sounddevice>=0.5; sys_platform == 'win32'",
+#   "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
 # ]
 # ///
 """heard-daemon: local, real-time transcript of what you say and what you hear.
@@ -20,7 +20,9 @@ Capturing never changes routing: no modules are loaded, no streams are moved, no
 Per platform, the capture is a child process that writes 16 kHz mono s16le PCM to its stdout:
   Linux    parec on the default sink's monitor and on the default source (PulseAudio / PipeWire)
   macOS    heard-tap (macos/heard-tap.swift): a Core Audio process tap for "them", the input device for "me"
-  Windows  this script in `tap` mode: a WASAPI loopback input for "them", the default microphone for "me"
+  Windows  this script in `tap` mode (PyAudioWPatch): the WASAPI loopback of the default output for "them",
+           the default microphone for "me"
+While capture is paused there is no capture process at all, so the system's microphone indicator is off.
 
 Utterances go into ~/.local/share/heard/heard.db (SQLite FTS5); `heard` searches them.
 Nothing leaves the machine. Capture is off until `heard resume` (or the overlay's Listening switch) turns it
@@ -69,7 +71,8 @@ HEARTBEAT_PATH = DATA_DIRECTORY / "daemon.alive"   # touched every 2 s while the
 
 THEM_SOURCE = os.environ.get("HEARD_THEM_SOURCE", "")   # empty: follow the current default output
 ME_SOURCE = os.environ.get("HEARD_ME_SOURCE", "")       # empty: the default microphone
-SOURCE_CHECK_SECONDS = 5.0 if IS_WINDOWS else 2.0       # the Windows check starts a Python process
+SOURCE_CHECK_SECONDS = 10.0 if IS_WINDOWS else 2.0      # the Windows check starts a Python process
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}   # no console flashes on Windows
 MODEL_NAME = os.environ.get("HEARD_MODEL", "large-v3-turbo")
 CPU_MODEL_NAME = os.environ.get("HEARD_CPU_MODEL", "small.en")   # used when there is no usable GPU
 CPU_THREADS = int(os.environ.get("HEARD_CPU_THREADS", str(max(2, (os.cpu_count() or 12) // 2))))   # half the cores
@@ -102,7 +105,8 @@ def query_helper(what):
         command = [mac_helper(), what]
     else:
         command = [sys.executable, os.path.abspath(__file__), "tap", what]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **NO_WINDOW)
     return result.stdout.strip()
 
 
@@ -133,61 +137,64 @@ def capture_command(speaker, source):
 def windows_tap(arguments):
     """`heard-daemon tap default-output|default-input|them [device]|me [device]` on Windows: the
     parec / heard-tap equivalent, run as a child process so each capture gets a fresh device list.
-    "them" is the WASAPI loopback input that PortAudio exposes for every output device."""
-    import sounddevice
+    "them" is the WASAPI loopback device that PyAudioWPatch exposes for every output device (the stock
+    PortAudio builds, e.g. sounddevice's, have no loopback devices)."""
+    import pyaudiowpatch as pyaudio
 
-    wasapi_index = next((index for index, api in enumerate(sounddevice.query_hostapis())
-                         if api["name"] == "Windows WASAPI"), None)
-    if wasapi_index is None:
+    audio = pyaudio.PyAudio()
+    try:
+        wasapi = audio.get_host_api_info_by_type(pyaudio.paWASAPI)
+    except OSError:
         sys.exit("no WASAPI host API; Windows Vista or newer is required")
-    wasapi = sounddevice.query_hostapis(wasapi_index)
-    devices = [(index, device) for index, device in enumerate(sounddevice.query_devices())
-               if device["hostapi"] == wasapi_index]
+    devices = [device for device in audio.get_device_info_generator() if device["hostApi"] == wasapi["index"]]
 
-    def loopback_of(output_name):
-        wanted = f"{output_name} [Loopback]"
-        for index, device in devices:
-            if device["name"] == wanted and device["max_input_channels"] > 0:
-                return index, device
-        sys.exit(f"no loopback input for output {output_name!r}; is sounddevice >= 0.5 installed?")
+    def loopback_of(output):
+        try:
+            return audio.get_wasapi_loopback_analogue_by_dict(output)
+        except (LookupError, ValueError):
+            sys.exit(f"no loopback device for output {output['name']!r}")
 
     def by_name(name):
-        for index, device in devices:
-            if device["name"] == name and device["max_input_channels"] > 0:
-                return index, device
+        for device in devices:
+            if device["name"] == name and device["maxInputChannels"] > 0:
+                return device
         sys.exit(f"no input device named {name!r}")
 
     what = arguments[0] if arguments else ""
     wanted = arguments[1] if len(arguments) > 1 and arguments[1] else ""
     if what == "default-output":
-        output = sounddevice.query_devices(wasapi["default_output_device"])
-        print(loopback_of(output["name"])[1]["name"])
+        print(loopback_of(audio.get_default_wasapi_device(d_out=True))["name"])
         return 0
     if what == "default-input":
-        print(sounddevice.query_devices(wasapi["default_input_device"])["name"])
+        print(audio.get_default_wasapi_device(d_in=True)["name"])
         return 0
     if what == "them":
-        index, device = by_name(wanted) if wanted else loopback_of(
-            sounddevice.query_devices(wasapi["default_output_device"])["name"])
+        device = by_name(wanted) if wanted else loopback_of(audio.get_default_wasapi_device(d_out=True))
     elif what == "me":
-        index, device = by_name(wanted) if wanted else (
-            wasapi["default_input_device"], sounddevice.query_devices(wasapi["default_input_device"]))
+        device = by_name(wanted) if wanted else audio.get_default_wasapi_device(d_in=True)
     else:
         sys.exit("usage: heard-daemon tap default-output | default-input | them [device] | me [device]")
 
-    rate = int(device["default_samplerate"])
-    channels = min(2, int(device["max_input_channels"]))
+    rate = int(device["defaultSampleRate"])
+    channels = max(1, int(device["maxInputChannels"]))   # WASAPI shared mode wants the device's own layout
     block = int(rate * FRAME_SECONDS)
     print(f"capturing {what}: {device['name']} at {rate} Hz, {channels} ch", file=sys.stderr, flush=True)
+    stream = audio.open(format=pyaudio.paFloat32, channels=channels, rate=rate, input=True,
+                        input_device_index=device["index"], frames_per_buffer=block)
     out = sys.stdout.buffer
-    with sounddevice.InputStream(device=index, channels=channels, samplerate=rate, dtype="float32",
-                                 blocksize=block) as stream:
+    try:
         while True:
-            frames, _ = stream.read(block)
-            mono = frames.mean(axis=1) if frames.ndim == 2 else frames
+            # a loopback stream delivers nothing while the output is silent; read() just waits
+            frames = numpy.frombuffer(stream.read(block, exception_on_overflow=False), dtype=numpy.float32)
+            mono = frames.reshape(-1, channels).mean(axis=1) if channels > 1 else frames
             resampled = resample_to_16k(mono, rate)
             out.write((numpy.clip(resampled, -1.0, 1.0) * 32767).astype("<i2").tobytes())
             out.flush()
+    except (BrokenPipeError, OSError):
+        return 0
+    finally:
+        stream.close()
+        audio.terminate()
 
 
 def resample_to_16k(mono, rate):
@@ -236,15 +243,19 @@ def open_database():
 
 
 def capture(speaker, resolve_source, chunks):
-    """Read one source forever, cut it into utterances with a simple energy gate, queue them.
+    """Read one source while Listening is on, cut it into utterances with a simple energy gate, queue them.
 
-    resolve_source() is re-checked every few seconds; when it changes (the default output was
-    switched), the capture restarts on the new source straight away."""
+    While paused there is no capture process at all. watch_capture() ends the process when Listening is
+    turned off or the default device changes (resolve_source() differs), and the loop starts over."""
     while not stopping.is_set():
+        if PAUSE_FLAG.exists():
+            stopping.wait(0.25)
+            continue
         source = resolve_source()
-        last_check = time.time()
-        switched = False
-        process = subprocess.Popen(capture_command(speaker, source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(capture_command(speaker, source), stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, **NO_WINDOW)
+        ended = {"why": None}
+        threading.Thread(target=watch_capture, args=(process, source, resolve_source, ended), daemon=True).start()
         log(f"capturing {speaker} from {source or 'the default device'}")
         noise_floor = 200.0
         utterance_frames = []
@@ -254,16 +265,8 @@ def capture(speaker, resolve_source, chunks):
         last_partial = 0.0
         while not stopping.is_set():
             raw = process.stdout.read(FRAME_SAMPLES * 2)
-            if not raw or len(raw) < FRAME_SAMPLES * 2:
+            if not raw or len(raw) < FRAME_SAMPLES * 2 or ended["why"]:
                 break
-            if PAUSE_FLAG.exists():
-                utterance_frames, speech_frames, silent_run, started_at = [], 0, 0, None
-                continue
-            if time.time() - last_check >= SOURCE_CHECK_SECONDS:
-                last_check = time.time()
-                if resolve_source() != source:
-                    switched = True
-                    break
             frame = numpy.frombuffer(raw, dtype=numpy.int16)
             loudness = float(numpy.sqrt(numpy.mean(frame.astype(numpy.float32) ** 2)))
             is_speech = loudness > max(noise_floor * 3.0, 300.0)
@@ -290,11 +293,33 @@ def capture(speaker, resolve_source, chunks):
                     latest_partials.pop(speaker, None)
                 utterance_frames, speech_frames, silent_run, started_at = [], 0, 0, None
         process.terminate()
-        if switched:
-            log(f"{speaker}: output changed, following it")
+        process.wait()
+        with partials_lock:
+            latest_partials.pop(speaker, None)
+        if ended["why"] == "switched":
+            log(f"{speaker}: device changed, following it")
+        elif ended["why"] == "paused":
+            log(f"{speaker}: paused, capture stopped")
         elif not stopping.is_set():
             log(f"{speaker} capture from {source or 'the default device'} ended; retrying in 5 s")
-            time.sleep(5)
+            stopping.wait(5)
+
+
+def watch_capture(process, source, resolve_source, ended):
+    """Beside the reader, which can block for a long time (a WASAPI loopback delivers nothing while the
+    output is silent): end the capture process as soon as Listening is off, or when the device changed."""
+    last_check = time.time()
+    while process.poll() is None:
+        if stopping.is_set() or PAUSE_FLAG.exists():
+            ended["why"] = "paused"
+        elif time.time() - last_check >= SOURCE_CHECK_SECONDS:
+            last_check = time.time()
+            if resolve_source() != source:
+                ended["why"] = "switched"
+        if ended["why"]:
+            process.terminate()
+            return
+        time.sleep(0.25)
 
 
 def load_model():
@@ -319,10 +344,16 @@ def load_model():
 
 
 def write_live(live):
+    """Live captions are best effort: on Windows the replace fails while a reader has the file open."""
     temporary = LIVE_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(live))
+    temporary.write_text(json.dumps(live), encoding="utf-8")
     os.chmod(temporary, 0o600)
-    os.replace(temporary, LIVE_PATH)
+    for _ in range(10):
+        try:
+            os.replace(temporary, LIVE_PATH)
+            return
+        except PermissionError:
+            time.sleep(0.02)
 
 
 def transcribe(chunks, connection):
@@ -393,8 +424,8 @@ def exit_before_sleep():
     """Linux only. A CUDA context kept across suspend/resume faulted the GPU (NVIDIA Xid 31 → "reboot
     required"). So hold a logind delay lock, and when sleep is announced, exit: the lock is released
     with the process, the machine sleeps, and systemd starts a fresh process (fresh CUDA context) after
-    resume. On macOS and Windows the capture child simply exits when its device goes quiet and is
-    restarted by capture()."""
+    resume. On macOS and Windows a capture child that fails (sleep, an unplugged headset) is restarted
+    by capture() on whatever the default device is then."""
     inhibitor = subprocess.Popen(
         ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=heard",
          "--why=release the GPU before suspend", "sleep", "infinity"],
@@ -411,9 +442,35 @@ def exit_before_sleep():
             os._exit(EXIT_FOR_SLEEP)
 
 
+def single_instance(name):
+    """An exclusive lock held for the life of the process; None if another instance holds it. On Windows,
+    stopping a Scheduled Task ends only its launcher, so an earlier daemon can still be running."""
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    handle = open(DATA_DIRECTORY / f"{name}.lock", "a+")
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def main():
-    if IS_WINDOWS and sys.argv[1:2] == ["tap"]:
-        return windows_tap(sys.argv[2:])
+    if IS_WINDOWS:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # device names in the log are not always ASCII
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        if sys.argv[1:2] == ["tap"]:
+            return windows_tap(sys.argv[2:])
+    lock = single_instance("daemon")
+    if lock is None:
+        log("another heard-daemon is already running; exiting")
+        return 0
     connection = open_database()
     if os.environ.get("HEARD_START_LISTENING"):
         PAUSE_FLAG.unlink(missing_ok=True)

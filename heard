@@ -41,6 +41,8 @@ def show(row):
 
 
 def main():
+    if os.name == "nt":   # transcripts can hold any character; the Windows default code page cannot
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("words", nargs="*", help="search terms, or pause / resume / status")
     parser.add_argument("--last", type=parse_duration, help="only this far back, e.g. 3m")
@@ -66,7 +68,7 @@ def main():
     if not DATABASE_PATH.exists():
         print("No transcript yet: heard-daemon has not written anything.", file=sys.stderr)
         return 1
-    connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
+    connection = sqlite3.connect(DATABASE_PATH.as_uri() + "?mode=ro", uri=True)
     since = time.time() - arguments.last if arguments.last else 0
     query = " ".join(arguments.words)
     if query:
@@ -90,7 +92,7 @@ def main():
 def live_line(newest):
     """What is being said right now (partial text), newer than the last finished line."""
     try:
-        live = json.loads(LIVE_PATH.read_text())
+        live = json.loads(LIVE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     parts = [f"{speaker}: {entry['text']}" for speaker, entry in sorted(live.items())

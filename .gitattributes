@@ -1,0 +1,6 @@
+# Windows scripts keep CRLF line endings on every checkout; everything else stays LF, so the Python scripts
+# and shell scripts are byte-identical on Linux, macOS and Windows.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
