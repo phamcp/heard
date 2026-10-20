@@ -511,7 +511,30 @@ class LivePane(QWidget):
         layout.addLayout(tools)
         self.setLayout(layout)
         self._last_html = None
+        # Follow the newest line unless the reader scrolled up; scrolling back to the bottom follows again.
+        # setHtml() resets the scroll bar and the new length is only known after layout, so the position is
+        # (re)applied whenever the range changes, not just right after setHtml().
+        self.follow = True
+        self.position = 0          # where the reader left the scroll bar while not following
+        self.updating = False      # True while we move the scroll bar ourselves
+        self._searching = False
+        bar = self.view.verticalScrollBar()
+        bar.valueChanged.connect(self.on_scroll)
+        bar.rangeChanged.connect(self.on_range)
         store.changed.connect(self.render)
+
+    def on_scroll(self, value):
+        if self.updating:
+            return
+        bar = self.view.verticalScrollBar()
+        self.follow = value >= bar.maximum() - 4
+        self.position = value
+
+    def on_range(self, _minimum, maximum):
+        was_updating = self.updating   # this also fires from inside setHtml(): keep render()'s guard up
+        self.updating = True
+        self.view.verticalScrollBar().setValue(maximum if self.follow else min(self.position, maximum))
+        self.updating = was_updating
 
     def render(self):
         store = self.store
@@ -535,13 +558,17 @@ class LivePane(QWidget):
             for speaker, text in store.live:
                 parts.append(f'<div style="color:#8a8a8a;margin:0 0 3px 0"><i>… {speaker}: {escape(text)}</i></div>')
         bar = self.view.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - 4
         html = "".join(parts)
+        searching = store.search_results is not None
+        if searching != self._searching:   # entering or leaving search: start at the newest line
+            self._searching = searching
+            self.follow = True
         if html != self._last_html:
             self._last_html = html
+            self.updating = True
             self.view.setHtml(html)
-            if at_bottom or store.search_results is not None:
-                bar.setValue(bar.maximum())
+            bar.setValue(bar.maximum() if self.follow else min(self.position, bar.maximum()))
+            self.updating = False
 
 
 class LogsPane(QWidget):
