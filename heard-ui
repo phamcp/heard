@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QSystemTrayIcon, QTextBrowser,
                                QVBoxLayout, QWidget)
@@ -280,6 +280,12 @@ QPushButton { background: rgba(255,255,255,0.09); border: none; border-radius: 1
 QPushButton:hover { background: rgba(255,255,255,0.17); }
 QPushButton#icon { background: transparent; color: #9c9c9c; padding: 4px 6px; font-size: 13px; }
 QPushButton#icon:hover { color: #ffffff; }
+QPushButton#switch { font-weight: 600; padding: 5px 13px; }
+QPushButton#switch[state="paused"] { background: #f5b731; color: #1d1600; }
+QPushButton#switch[state="paused"]:hover { background: #ffc94d; }
+QPushButton#switch[state="listening"] { background: #e03a30; color: #ffffff; }
+QPushButton#switch[state="listening"]:hover { background: #f04c42; }
+QPushButton#switch[state="off"] { background: rgba(255,255,255,0.09); color: #8a8a8a; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
 QTextBrowser { background: transparent; border: none; }
 QLabel#status { color: #9c9c9c; font-size: 10px; }
@@ -312,7 +318,11 @@ class Overlay(QWidget):
         self.expanded = True
         self.drag_offset = None
 
-        self.listen_button = pill("", store.toggle_listening, tooltip=f"Start / stop capturing ({MOD}L)")
+        self.listen_button = pill("", store.toggle_listening, "switch", f"Start / stop capturing ({MOD}L)")
+        self.blink_on = True
+        self.blink = QTimer(self)
+        self.blink.timeout.connect(self.toggle_blink)
+        self.blink.start(700)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search the retained history…  (Enter; clear to go back live)")
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -363,10 +373,22 @@ class Overlay(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        listening = self.store.listening and self.store.daemon_running
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setBrush(QColor(20, 20, 25, 232))
-        painter.setPen(QColor(255, 255, 255, 36))
+        pen = QPen(QColor(224, 58, 48, 220 if self.blink_on else 120) if listening else QColor(255, 255, 255, 36))
+        pen.setWidth(2 if listening else 1)
+        painter.setPen(pen)
         painter.drawRoundedRect(rect, 15, 15)
+
+    def toggle_blink(self):
+        if self.store.listening and self.store.daemon_running:
+            self.blink_on = not self.blink_on
+            self.render_switch()
+            self.update()
+        elif not self.blink_on:
+            self.blink_on = True
+            self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -393,17 +415,26 @@ class Overlay(QWidget):
         self.move(QPoint(screen.center().x() - BAR_WIDTH // 2, screen.top() + 10))
 
     # rendering
-    def render_state(self):
+    def render_switch(self):
         store = self.store
         if not store.daemon_running:
-            label, color = "Daemon off", "#777"
+            state, label = "off", "○  Daemon off"
         elif store.listening:
             minutes = int((time.time() - (store.listening_since or time.time())) / 60)
-            label, color = f"Listening · {minutes} min" if minutes else "Listening", "#ff3b30"
+            dot = "●" if self.blink_on else "○"
+            state, label = "listening", f"{dot}  Listening · {minutes} min  ·  Stop" if minutes else f"{dot}  Listening  ·  Stop"
         else:
-            label, color = "Paused", "#8a8a8a"
-        self.listen_button.setText(f"●  {label}   {MOD}L")
-        self.listen_button.setStyleSheet(f"color: {color}; font-weight: 600;" if store.listening else "")
+            state, label = "paused", "▶  Paused  ·  Start listening"
+        self.listen_button.setText(f"{label}   {MOD}L")
+        if self.listen_button.property("state") != state:
+            self.listen_button.setProperty("state", state)
+            self.listen_button.style().unpolish(self.listen_button)
+            self.listen_button.style().polish(self.listen_button)
+            self.update()
+
+    def render_state(self):
+        store = self.store
+        self.render_switch()
 
         shown = store.search_results if store.search_results is not None else store.lines
         parts = []
