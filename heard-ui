@@ -30,8 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
                                QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
@@ -49,6 +49,7 @@ CONFIG_PATH = DATA_DIRECTORY / "ui-config.json"
 SESSION_PATH = DATA_DIRECTORY / "session.json"   # the current call's start time, kept across overlay restarts
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
+MINI_WIDTH, MINI_HEIGHT = 112, 38   # collapsed: logo, play/pause, stop
 LOG_SUFFIX = " heard.md"
 
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0}   # view_since: last Stop recording
@@ -456,6 +457,9 @@ QPushButton#switch[state="off"] { background: rgba(255,255,255,0.09); color: #8a
 QPushButton#tab { background: rgba(255,255,255,0.09); color: #d0d0d0; padding: 5px 11px; }
 QPushButton#stop { background: rgba(224,58,48,0.22); color: #ffb4ae; }
 QPushButton#stop:hover { background: rgba(224,58,48,0.4); color: #ffffff; }
+QPushButton#mini { background: rgba(255,255,255,0.09); padding: 0; border-radius: 13px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; }
+QPushButton#mini:hover { background: rgba(255,255,255,0.2); }
+QPushButton#logo { background: transparent; padding: 0; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; }
 QPushButton#tab[active="true"] { background: rgba(255,255,255,0.14); color: #ffffff; font-weight: 600; }
 QLineEdit { background: rgba(255,255,255,0.09); border: none; border-radius: 13px; padding: 5px 11px; }
 QTextBrowser { background: transparent; border: none; }
@@ -678,6 +682,25 @@ class Overlay(QWidget):
         bar_widget = QWidget()
         bar_widget.setLayout(bar)
         bar_widget.setFixedHeight(BAR_HEIGHT)
+        self.bar_widget = bar_widget
+
+        # collapsed: just the logo (click to expand), play/pause and stop
+        self.logo_button = pill("", self.toggle_expanded, "logo", "Expand")
+        self.logo_button.setIconSize(QSize(26, 26))
+        self.mini_switch = pill("", store.toggle_listening, "mini", f"Start / pause capturing ({MOD}L)")
+        self.mini_stop = pill("", store.stop_recording, "mini", "Stop recording: file this call in the library and pause")
+        self.mini_stop.setIcon(glyph_icon("stop"))
+        for button in (self.mini_switch, self.mini_stop):
+            button.setIconSize(QSize(12, 12))
+        mini = QHBoxLayout()
+        mini.setContentsMargins(5, 0, 8, 0)
+        mini.setSpacing(6)
+        mini.addWidget(self.logo_button)
+        mini.addWidget(self.mini_switch)
+        mini.addWidget(self.mini_stop)
+        self.mini_widget = QWidget()
+        self.mini_widget.setLayout(mini)
+        self.mini_widget.setFixedHeight(MINI_HEIGHT)
 
         self.stack = QStackedWidget()
         self.live_pane = LivePane(store)
@@ -698,6 +721,7 @@ class Overlay(QWidget):
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        root.addWidget(self.mini_widget)
         root.addWidget(bar_widget)
         root.addWidget(self.pane, 1)
         self.setLayout(root)
@@ -705,8 +729,9 @@ class Overlay(QWidget):
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=hide_me)
         store.changed.connect(self.render_switch)
         store.status_changed.connect(self.status.setText)
-        store.listening_started.connect(lambda: self.show_tab(0))
-        store.recording_stopped.connect(lambda: self.show_tab(1))
+        # switch tabs behind the scenes; only the user expands the collapsed overlay
+        store.listening_started.connect(lambda: self.show_tab(0, expand=False))
+        store.recording_stopped.connect(lambda: self.show_tab(1, expand=False))
         self.blink = QTimer(self)
         self.blink.timeout.connect(self.toggle_blink)
         self.blink.start(700)
@@ -718,13 +743,14 @@ class Overlay(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        listening = self.store.listening
+        listening = self.store.listening and self.expanded   # the collapsed pill never turns red
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setBrush(QColor(20, 20, 25, 232))
         pen = QPen(QColor(224, 58, 48, 220 if self.blink_on else 120) if listening else QColor(255, 255, 255, 36))
         pen.setWidth(2 if listening else 1)
         painter.setPen(pen)
-        painter.drawRoundedRect(rect, 15, 15)
+        radius = min(15, rect.height() / 2)
+        painter.drawRoundedRect(rect, radius, radius)
 
     def toggle_blink(self):
         if self.store.listening:
@@ -751,21 +777,32 @@ class Overlay(QWidget):
         self.apply_size()
 
     def apply_size(self):
+        """Expanded: the full bar and pane. Collapsed: a small pill, kept centred where the bar was."""
+        centre_x = self.geometry().center().x() if self.isVisible() else None
+        self.bar_widget.setVisible(self.expanded)
         self.pane.setVisible(self.expanded)
-        self.expand_button.setText("⌃" if self.expanded else "⌄")
-        self.setFixedSize(BAR_WIDTH, BAR_HEIGHT + (PANE_HEIGHT if self.expanded else 0))
+        self.mini_widget.setVisible(not self.expanded)
+        if self.expanded:
+            self.setFixedSize(BAR_WIDTH, BAR_HEIGHT + PANE_HEIGHT)
+        else:
+            self.setFixedSize(MINI_WIDTH, MINI_HEIGHT)
+        if centre_x is not None:
+            screen = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+            x = min(max(centre_x - self.width() // 2, screen.left()), screen.right() - self.width())
+            self.move(x, self.y())
+        self.update()
 
     def place_at_top(self):
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(QPoint(screen.center().x() - BAR_WIDTH // 2, screen.top() + 10))
 
-    def show_tab(self, index):
+    def show_tab(self, index, expand=True):
         self.stack.setCurrentIndex(index)
         self.logs_tab.setProperty("active", "true" if index == 1 else "false")
         repolish(self.logs_tab)
         if index == 1:
             self.logs_pane.reload()
-        if not self.expanded:
+        if expand and not self.expanded:
             self.toggle_expanded()
 
     def toggle_logs(self):
@@ -783,6 +820,9 @@ class Overlay(QWidget):
         else:
             state, label = "paused", "▶  Start listening"
         self.switch.setText(f"{label}   {MOD}L")
+        self.logo_button.setIcon(tray_icon(False))   # collapsed stays neutral: no colour, no blinking
+        self.mini_switch.setIcon(glyph_icon("pause" if store.listening else "play"))
+        self.mini_switch.setEnabled(store.daemon_running)
         if self.switch.property("state") != state:
             self.switch.setProperty("state", state)
             repolish(self.switch)
@@ -845,6 +885,25 @@ def tray_icon(listening):
     painter.setBrush(QColor(255, 255, 255, 230))
     for i, h in enumerate((6, 12, 20, 12, 6)):   # a small waveform glyph
         painter.drawRoundedRect(12 + i * 5, 22 - h // 2, 3, h, 1.5, 1.5)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def glyph_icon(kind):
+    """Play / pause / stop drawn rather than typed, so they look the same with every system font."""
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor("#d0d0d0"))
+    if kind == "play":
+        painter.drawPolygon(QPolygon([QPoint(7, 4), QPoint(20, 12), QPoint(7, 20)]))
+    elif kind == "pause":
+        painter.drawRoundedRect(5, 4, 5, 16, 1.5, 1.5)
+        painter.drawRoundedRect(14, 4, 5, 16, 1.5, 1.5)
+    else:
+        painter.drawRoundedRect(5, 5, 14, 14, 2.5, 2.5)
     painter.end()
     return QIcon(pixmap)
 
@@ -955,6 +1014,8 @@ def main():
         def shoot():
             if os.environ.get("HEARD_UI_TAB") == "logs":
                 overlay.show_tab(1)
+            elif os.environ.get("HEARD_UI_TAB") == "mini":
+                overlay.toggle_expanded()
             overlay.grab().save(os.environ["HEARD_UI_SCREENSHOT"])
             app.quit()
         QTimer.singleShot(int(os.environ.get("HEARD_UI_SCREENSHOT_DELAY", "3000")), shoot)
