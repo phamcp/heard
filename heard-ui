@@ -13,7 +13,7 @@ A translucent, always-on-top bar that is excluded from screen sharing, with:
   - Stop recording: files the transcript shown in the library as a Markdown log, clears the view and pauses.
     Each log gets a title made from the transcript's own most prominent phrases (local keyword extraction;
     nothing is sent anywhere).
-  - the transcript as it lands (the sentence in progress dimmed), search, Copy
+  - the transcript as it lands (the sentence in progress dimmed), search, Copy transcript (while a call is on screen)
   - Library: every logged call, with its text, Copy and Show in folder
   - a tray / menu bar icon that shows whether capture is on
 
@@ -34,7 +34,7 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, 
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
-                               QStackedWidget, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
+                               QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
@@ -51,7 +51,7 @@ CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window vis
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
 LOG_SUFFIX = " heard.md"
 
-DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard")}
+DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0}   # view_since: last Stop recording
 
 
 def load_settings():
@@ -199,8 +199,9 @@ class Store(QObject):
         self.daemon_running = False
         self.search_results = None
         self.session_start = self._load_session()
-        # show the current call from its start, or the last three hours
-        self.newest = (self.session_start - 1) if self.session_start else time.time() - 3 * 3600
+        # show the current call from its start, else the last three hours, but never what Stop recording cleared
+        self.newest = (self.session_start - 1) if self.session_start else max(
+            time.time() - 3 * 3600, float(self.settings.get("view_since") or 0))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(500)
@@ -274,10 +275,12 @@ class Store(QObject):
         self.logs_changed.emit()
 
     def clear_view(self):
-        """Empty the live view; the log keeps the text."""
+        """Empty the live view (the log keeps the text), also for the next overlay start."""
         self.lines = []
         self.search_results = None
         self.newest = time.time()
+        self.settings["view_since"] = self.newest
+        save_settings(self.settings)
         self.changed.emit()
 
     def log_folder(self):
@@ -477,9 +480,16 @@ class LivePane(QWidget):
         self.store = store
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
+        self.copy_button = pill("Copy transcript", store.copy_transcript, tooltip="Copy everything shown, as text")
+        tools = QHBoxLayout()
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.addWidget(self.copy_button)
+        tools.addStretch(1)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.view)
+        layout.setSpacing(6)
+        layout.addWidget(self.view, 1)
+        layout.addLayout(tools)
         self.setLayout(layout)
         self._last_html = None
         store.changed.connect(self.render)
@@ -487,6 +497,7 @@ class LivePane(QWidget):
     def render(self):
         store = self.store
         shown = store.shown_lines()
+        self.copy_button.setVisible(bool(shown) and (store.session_start is not None or store.search_results is not None))
         parts = []
         if not shown:
             if store.search_results is not None:
@@ -529,6 +540,7 @@ class LogsPane(QWidget):
         self.copy_button = pill("Copy log", self.copy_log, tooltip="Copy this log as text")
         self.reveal_button = pill("Show in folder", self.reveal_log)
         self.delete_button = pill("Delete", self.delete_log, tooltip="Move this log to the Trash / delete it")
+        self.delete_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
         tools = QHBoxLayout()
         tools.setContentsMargins(0, 0, 0, 0)
         tools.addWidget(self.copy_button)
@@ -630,7 +642,6 @@ class Overlay(QWidget):
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.returnPressed.connect(lambda: store.search(self.search.text()))
         self.search.textChanged.connect(lambda text: store.search("") if not text else None)
-        self.copy_button = pill("Copy", store.copy_transcript, tooltip="Copy the whole transcript shown")
         self.stop_button = pill("■  Stop recording", store.stop_recording, "stop",
                                 "File this call in the library, clear the view and pause")
         self.expand_button = pill("⌃", self.toggle_expanded, "icon", "Collapse / expand")
@@ -642,7 +653,7 @@ class Overlay(QWidget):
         bar.setSpacing(8)
         bar.addWidget(self.switch)
         bar.addWidget(self.logs_tab)
-        for widget in (self.search, self.copy_button, self.stop_button, self.expand_button,
+        for widget in (self.search, self.stop_button, self.expand_button,
                        self.settings_button, self.hide_button):
             bar.addWidget(widget)
         bar_widget = QWidget()

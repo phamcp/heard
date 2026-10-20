@@ -115,7 +115,7 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
 | transcript | lines as they land, the sentence in progress dimmed; the search field searches the retained history (Enter), clear it to go back live |
 | **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Delete |
-| **Copy** | the whole transcript shown, as text, to the clipboard |
+| **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
 | ⚙ | the library folder |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
