@@ -32,7 +32,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
                                QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -53,7 +53,8 @@ BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
 MINI_WIDTH, MINI_HEIGHT = 112, 38   # collapsed: logo, play/pause, stop
 LOG_SUFFIX = " heard.md"
 
-DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0}   # view_since: last Stop recording
+DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0,   # view_since: last Stop recording
+                    "summarizer": "local", "local_model": "gemma3:12b"}   # summarizer: local (Ollama) | claude | off
 
 
 def load_settings():
@@ -189,6 +190,174 @@ def safe_filename(text, limit=60):
     return text[:limit].rstrip(" ,")
 
 
+# --- meeting summaries ----------------------------------------------------------------------------------
+# After Stop recording the log is written at once with a keyword title; then a language model names the
+# meeting and adds a summary, key points and action items at the top. "local" (the default) asks Ollama on
+# this machine, so nothing leaves it; "claude" sends the transcript to the Anthropic API; "off" skips it.
+
+OLLAMA_URL = os.environ.get("HEARD_OLLAMA_URL", "http://127.0.0.1:11434")
+SUMMARY_CHUNK_CHARS = 40000   # about 10k tokens per pass; longer calls are summarized in parts, then combined
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "action_items": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "summary", "key_points", "action_items"],
+}
+SUMMARY_PROMPT = """You are given the transcript of a call, transcribed automatically, so expect some misheard words.
+"me" is the person who recorded the call; "them" is everyone else on the call, mixed together.
+
+Return a JSON object with:
+- title: what the meeting was about, 3 to 8 words. Be specific: name the company, product or topic from the call.
+  No date, no quotes, no trailing period.
+- summary: 2 to 4 plain sentences on who met, what for, and where it landed.
+- key_points: up to 7 short bullets with the substance: decisions, numbers, dates, objections, open questions.
+- action_items: who does what and by when, only if it was said in the call. An empty list if there were none.
+
+Write plain business English. Use only what is in the transcript; never invent names, numbers or commitments.
+Do not use em dashes."""
+LOG_LINE = re.compile(r"^- (\d\d:\d\d:\d\d) \*\*(\w+)\*\*: (.*)$")
+
+
+def _http_json(url, payload=None, headers=None, timeout=60, use_proxy=True):
+    import urllib.request
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(url, data=data, headers={"content-type": "application/json", **(headers or {})})
+    opener = urllib.request.build_opener() if use_proxy else urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _ask_local(model, system, user):
+    reply = _http_json(f"{OLLAMA_URL}/api/chat", {
+        "model": model, "stream": False, "format": SUMMARY_SCHEMA, "keep_alive": "5m",
+        "options": {"temperature": 0.2, "num_ctx": 16384},
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }, timeout=900, use_proxy=False)
+    return json.loads(reply["message"]["content"])
+
+
+def _claude_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key and IS_WINDOWS:   # set with setx after the overlay started: read the user environment directly
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as env:
+                key = winreg.QueryValueEx(env, "ANTHROPIC_API_KEY")[0]
+        except OSError:
+            pass
+    if not key:
+        raise RuntimeError("no ANTHROPIC_API_KEY set")
+    return key
+
+
+def _claude_model(key):
+    """HEARD_CLAUDE_MODEL, else the newest Sonnet the key can use (the models list is newest first)."""
+    if os.environ.get("HEARD_CLAUDE_MODEL"):
+        return os.environ["HEARD_CLAUDE_MODEL"]
+    listing = _http_json("https://api.anthropic.com/v1/models?limit=100",
+                         headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=30)
+    ids = [model["id"] for model in listing.get("data", [])]
+    return next((i for i in ids if "sonnet" in i), ids[0] if ids else "")
+
+
+def _ask_claude(system, user):
+    key = _claude_key()
+    reply = _http_json("https://api.anthropic.com/v1/messages", {
+        "model": _claude_model(key), "max_tokens": 2000, "temperature": 0.2,
+        "system": system + "\nReply with only the JSON object.",
+        "messages": [{"role": "user", "content": user}],
+    }, headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=300)
+    text = "".join(block.get("text", "") for block in reply.get("content", []))
+    return json.loads(text[text.find("{"):text.rfind("}") + 1])
+
+
+def _tidy(result):
+    def plain(text):
+        text = str(text).strip().replace(" \u2014 ", ", ").replace("\u2014", ", ").replace(" \u2013 ", ", ")
+        return re.sub(r"\s+", " ", text)
+    title = plain(result.get("title", "")).strip("\"'*#").rstrip(".")[:80]
+    return {"title": title,
+            "summary": plain(result.get("summary", "")),
+            "key_points": [plain(p) for p in result.get("key_points", []) if str(p).strip()][:7],
+            "action_items": [plain(p) for p in result.get("action_items", []) if str(p).strip()][:10]}
+
+
+def summarize_transcript(text, settings):
+    """{"title", "summary", "key_points", "action_items"} for a transcript in `as_text` form. Raises on failure."""
+    if settings.get("summarizer") == "claude":
+        ask = _ask_claude
+    else:
+        model = settings.get("local_model") or DEFAULT_SETTINGS["local_model"]
+        ask = lambda system, user: _ask_local(model, system, user)
+    if len(text) <= SUMMARY_CHUNK_CHARS:
+        return _tidy(ask(SUMMARY_PROMPT, text))
+    parts, current = [], ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > SUMMARY_CHUNK_CHARS:
+            parts.append(current)
+            current = ""
+        current += line
+    parts.append(current)
+    notes = []
+    for number, part in enumerate(parts, 1):
+        result = _tidy(ask(SUMMARY_PROMPT + f"\n\nThis is part {number} of {len(parts)} of one long call.", part))
+        notes.append(f"Part {number}: {result['summary']}\n" +
+                     "\n".join(f"- {point}" for point in result["key_points"] + result["action_items"]))
+    return _tidy(ask(SUMMARY_PROMPT + "\n\nInstead of the transcript you get notes on consecutive parts of one call. "
+                     "Combine them into one result for the whole call.", "\n\n".join(notes)))
+
+
+def render_log(title, detail, transcript_md, summary=None):
+    """The log file: title, when, then (once summarized) Summary / Key points / Action items, then the transcript."""
+    parts = [f"# {title}", f"_{detail}_" if detail else ""]
+    if summary:
+        parts += ["## Summary", summary["summary"] or "(no summary)"]
+        if summary["key_points"]:
+            parts += ["## Key points", "\n".join(f"- {point}" for point in summary["key_points"])]
+        if summary["action_items"]:
+            parts += ["## Action items", "\n".join(f"- {item}" for item in summary["action_items"])]
+        parts.append("## Transcript")
+    parts.append(transcript_md or "(nothing was transcribed)")
+    return "\n\n".join(part for part in parts if part) + "\n"
+
+
+def read_log(path):
+    """(title, detail, transcript markdown, transcript as text) from a log file, old or new layout."""
+    title, detail, transcript, text = "", "", [], []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        match = LOG_LINE.match(line)
+        if match:
+            transcript.append(line)
+            text.append(f"{match.group(1)} {match.group(2):>4}: {match.group(3).replace('**', '')}")
+        elif line.startswith("# ") and not title:
+            title = line[2:].strip()
+        elif line.startswith("_") and line.endswith("_") and not detail:
+            detail = line.strip("_")
+    return title, detail, "\n".join(transcript), "\n".join(text)
+
+
+def describe_summary_error(error, settings):
+    """A one-line reason for the status bar; the log keeps its keyword title either way."""
+    import urllib.error
+    if settings.get("summarizer") == "claude":
+        if isinstance(error, RuntimeError):
+            return "set ANTHROPIC_API_KEY to use Claude, or pick Local in Settings"
+        if isinstance(error, urllib.error.HTTPError):
+            return f"the Claude API answered {error.code}"
+        return f"could not reach the Claude API ({error})"
+    if isinstance(error, urllib.error.HTTPError) and error.code == 404:
+        return f"Ollama has no model {settings.get('local_model')}: run  ollama pull {settings.get('local_model')}"
+    if isinstance(error, urllib.error.HTTPError):
+        return f"Ollama answered {error.code} (out of GPU memory?); try Summarize again"
+    if isinstance(error, (urllib.error.URLError, ConnectionError, TimeoutError)):
+        return "Ollama is not running (install it from ollama.com and start it, or turn summaries off in Settings)"
+    return f"the model's answer was unusable ({error.__class__.__name__}); try Summarize again"
+
+
 # --- state --------------------------------------------------------------------------------------------
 
 class Store(QObject):
@@ -197,9 +366,12 @@ class Store(QObject):
     status_changed = Signal(str)
     listening_started = Signal()
     recording_stopped = Signal()
+    summary_finished = Signal(str, object, str)   # log path, summary (or None), error; emitted from a worker thread
 
     def __init__(self):
         super().__init__()
+        self.summarizing = set()      # log paths with a summary in progress
+        self.summary_finished.connect(self._apply_summary)
         self.transcript = Transcript()
         self.settings = load_settings()
         self.lines = []
@@ -272,7 +444,8 @@ class Store(QObject):
             self.recording_stopped.emit()
 
     def write_log(self, started, lines, detail, verb):
-        """A Markdown log titled from the transcript's own words, filed by start time."""
+        """A Markdown log filed by start time: written at once with a keyword title, then summarized and
+        renamed in the background (see summarize_log)."""
         topic = make_title(lines) or "untitled"
         when = time.strftime("%Y-%m-%d %H.%M", time.localtime(started))
         path = self.log_folder() / f"{when} {safe_filename(topic)}{LOG_SUFFIX}"
@@ -283,6 +456,65 @@ class Store(QObject):
             self.status_changed.emit(f"{verb}. Log saved: {topic}")
         except OSError as error:
             self.status_changed.emit(f"{verb}, but could not write the log: {error}")
+            path = None
+        self.logs_changed.emit()
+        if path and self.settings.get("summarizer", "local") != "off":
+            self.summarize_log(str(path))
+
+    def summarize_log(self, path):
+        """Name the meeting and add a summary, key points and action items to a log, in a worker thread."""
+        if path in self.summarizing:
+            return
+        if self.settings.get("summarizer") == "off":
+            self.status_changed.emit("Summaries are off (Settings)")
+            return
+        try:
+            _, _, _, text = read_log(path)
+        except OSError as error:
+            self.status_changed.emit(f"Could not read the log: {error}")
+            return
+        if not text.strip():
+            self.status_changed.emit("Nothing to summarize in this log")
+            return
+        self.summarizing.add(path)
+        settings = dict(self.settings)
+        engine = "Claude" if settings.get("summarizer") == "claude" else settings.get("local_model")
+        self.status_changed.emit(f"Summarizing the call with {engine}...")
+
+        def work():
+            try:
+                self.summary_finished.emit(path, summarize_transcript(text, settings), "")
+            except Exception as error:   # network, model or JSON trouble: keep the keyword title
+                self.summary_finished.emit(path, None, describe_summary_error(error, settings))
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_summary(self, path, summary, error):
+        """Back on the UI thread: rewrite the log with the summary on top and rename it after the meeting."""
+        self.summarizing.discard(path)
+        if summary is None:
+            self.status_changed.emit(f"Summary skipped: {error}")
+            return
+        old = Path(path)
+        if not old.exists():
+            return   # deleted while the model was working
+        try:
+            _, detail, transcript_md, _ = read_log(old)
+            title = summary["title"] or old.name[17:-len(LOG_SUFFIX)] or "untitled"
+            new = old.with_name(f"{old.name[:16]} {safe_filename(title)}{LOG_SUFFIX}")
+            number = 2
+            while new != old and new.exists():
+                new = old.with_name(f"{old.name[:16]} {safe_filename(title)} ({number}){LOG_SUFFIX}")
+                number += 1
+            new.write_text(render_log(title, detail, transcript_md, summary), encoding="utf-8")
+            os.chmod(new, 0o600)
+            if new != old:
+                old.unlink()
+            self.last_log_path = str(new)
+            self.status_changed.emit(f"Summarized: {title}")
+        except OSError as error:
+            self.status_changed.emit(f"Could not update the log: {error}")
         self.logs_changed.emit()
 
     def clear_view(self):
@@ -585,12 +817,15 @@ class LogsPane(QWidget):
         self.view.setOpenExternalLinks(True)
         self.copy_button = pill("Copy log", self.copy_log, tooltip="Copy this log as text")
         self.reveal_button = pill("Show in folder", self.reveal_log)
+        self.summarize_button = pill("Summarize", self.summarize_current,
+                                     tooltip="Name this meeting and add a summary, key points and action items")
         self.delete_button = pill("Delete", self.delete_log, tooltip="Move this log to the Trash / delete it")
         self.delete_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
         tools = QHBoxLayout()
         tools.setContentsMargins(0, 0, 0, 0)
         tools.addWidget(self.copy_button)
         tools.addWidget(self.reveal_button)
+        tools.addWidget(self.summarize_button)
         tools.addStretch(1)
         tools.addWidget(self.delete_button)
         right = QVBoxLayout()
@@ -637,6 +872,7 @@ class LogsPane(QWidget):
             text = Path(item.data(Qt.UserRole)).read_text(encoding="utf-8")
             if text.startswith("# "):
                 text = "#### " + text[2:]   # the title line, at a size that fits the pane
+            text = re.sub(r"(?m)^## ", "##### ", text)   # Summary / Key points / ... below the title
             self.view.setMarkdown(text)
         except OSError as error:
             self.view.setPlainText(f"Could not read the log: {error}")
@@ -651,6 +887,11 @@ class LogsPane(QWidget):
         path = self.current_path()
         if path:
             reveal(Path(path))
+
+    def summarize_current(self):
+        path = self.current_path()
+        if path:
+            self.store.summarize_log(path)
 
     def delete_log(self):
         path = self.current_path()
@@ -873,11 +1114,21 @@ class SettingsDialog(QDialog):
         folder_row = QHBoxLayout()
         folder_row.addWidget(self.folder)
         folder_row.addWidget(browse)
+        self.summarizer = QComboBox()
+        for label, value in (("Local model (Ollama): nothing leaves this machine", "local"),
+                             ("Claude API: sends each transcript to Anthropic", "claude"),
+                             ("Off: keyword titles only", "off")):
+            self.summarizer.addItem(label, value)
+        self.summarizer.setCurrentIndex(max(0, self.summarizer.findData(store.settings.get("summarizer", "local"))))
+        self.local_model = QLineEdit(store.settings.get("local_model") or DEFAULT_SETTINGS["local_model"])
+        self.local_model.setToolTip("Any model you have pulled in Ollama, e.g. gemma3:12b or qwen2.5:7b")
         form = QFormLayout()
         form.addRow("Library folder (Stop recording writes here)", folder_row)
+        form.addRow("Meeting titles and summaries", self.summarizer)
+        form.addRow("Local model", self.local_model)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
-                      "the machine.")
+                      "the machine unless you choose the Claude API for summaries (it reads ANTHROPIC_API_KEY).")
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", note)
@@ -897,6 +1148,8 @@ class SettingsDialog(QDialog):
 
     def save(self):
         self.store.settings["notes_folder"] = self.folder.text().strip() or DEFAULT_SETTINGS["notes_folder"]
+        self.store.settings["summarizer"] = self.summarizer.currentData()
+        self.store.settings["local_model"] = self.local_model.text().strip() or DEFAULT_SETTINGS["local_model"]
         save_settings(self.store.settings)
         self.store.logs_changed.emit()
         self.accept()

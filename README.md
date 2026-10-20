@@ -45,8 +45,9 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 - **Short memory.** Lines older than 3 days are deleted (`HEARD_RETENTION_DAYS`). Audio is never stored.
 - **Owner-only files.** The data folder, database, live captions and the overlay's settings are readable only by
   your user. The daemon log contains status lines, never transcript text.
-- **Nothing leaves the machine.** No cloud, no AI service, no network access at all beyond the one-time model
-  download.
+- **Nothing leaves the machine** by default. Speech is transcribed locally, and meeting summaries come from a local
+  model through [Ollama](https://ollama.com). The only exception is opt-in: choosing the Claude API for summaries
+  in Settings sends each finished call's transcript to Anthropic.
 - **Hidden from screen sharing.** The overlay window is excluded from screen capture on macOS and Windows.
 
 ## Requirements
@@ -129,14 +130,19 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **● Listening · Pause** (same key) | red, blinking, with the minutes since the call started; Pause only pauses, the transcript stays |
 | **■ Stop recording** | files the transcript shown in the library as a titled log, clears the view, pauses, and opens the Library on it |
 | transcript | lines as they land, the sentence in progress dimmed; the search field filters the retained history as you type (word prefixes match; quotes and OR work too), clear it to go back live |
-| **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Delete |
+| **Library** | toggles the list of logged calls in your library folder (`~/Documents/heard`), each with its text, Copy log, Show in folder, Summarize, Delete |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
-| ⚙ | the library folder |
+| ⚙ | the library folder, and where summaries come from (local model, Claude API, or off) |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
-Each log is titled from the transcript's own words (its most prominent phrases, e.g. "staging rollout, IAM
-change, platform team"): keyword extraction done locally, not a summary. The file name is the start time plus
-that title. Nothing is filed or cleared until you press Stop recording: the daemon pausing itself after the
+Stop recording writes the log at once, titled from the transcript's own words (its most prominent phrases, e.g.
+"staging rollout, IAM change, platform team"). Then a language model names the meeting and adds a Summary, Key
+points and Action items above the transcript, and the file is renamed after the meeting (the start time plus
+that title). By default the model runs locally: install [Ollama](https://ollama.com) and `ollama pull gemma3:12b`
+(about 8 GB; `qwen2.5:7b` is smaller). Settings can switch to the Claude API (it reads `ANTHROPIC_API_KEY` and
+sends the finished transcript to Anthropic) or turn summaries off. If the model is unavailable the log keeps its
+keyword title, and **Summarize** in the Library tries again; it also works on older logs.
+Nothing is filed or cleared until you press Stop recording: the daemon pausing itself after the
 time limit, or a restart, just pauses. Logs are kept until you delete them; the rolling transcript database
 behind the live view still expires after 3 days.
 
