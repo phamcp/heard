@@ -5,6 +5,7 @@
 #   "PySide6-Essentials>=6.7",   # QtCore, QtGui, QtWidgets only: a fraction of the full PySide6 download
 #   "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
 #   "keyring>=25",               # the Claude API key lives in Windows Credential Manager / macOS Keychain
+#   "numpy",                     # heard-kb (the knowledge base Ask reads) is loaded into this process
 # ]
 # ///
 """heard-ui: a light overlay for heard. macOS, Windows, Linux (one Qt script).
@@ -16,6 +17,8 @@ A translucent, always-on-top bar that is excluded from screen sharing, with:
     nothing is sent anywhere).
   - the transcript as it lands (the sentence in progress dimmed), search, Copy transcript (while a call is on screen)
   - Library: every logged call, with its text, Copy and Show in folder
+  - Ask: what to say next, from the live transcript, with the company's point of view and the passages heard-kb
+    finds in the knowledge folder (Settings) when an index is built
   - a tray / menu bar icon that shows whether capture is on
 
 Global hotkeys: ⌘⇧H show/hide, ⌘⇧L start/pause (Ctrl+Shift on Windows). None on Linux.
@@ -25,13 +28,14 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, QPoint, QProcess, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QGridLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
@@ -59,7 +63,9 @@ LOG_SUFFIX = " heard.md"
 DEFAULT_SETTINGS = {"notes_folder": str(Path.home() / "Documents/heard"), "view_since": 0.0,   # view_since: last Stop recording
                     "summarizer": "local", "local_model": "gemma3:12b",   # summarizer: local (Ollama) | claude | off
                     "hide_from_sharing": True,   # keep the overlay out of screen shares and recordings
-                    "claude_workspace": ""}      # wrkspc_... for API keys that aren't scoped to one workspace
+                    "claude_workspace": "",      # wrkspc_... for API keys that aren't scoped to one workspace
+                    "kb_enabled": True,          # Ask reads the knowledge folder (heard-kb) when it has an index
+                    "kb_folder": str(Path.home() / "Documents/heard/kb")}
 
 
 def load_settings():
@@ -511,6 +517,78 @@ the transcript for facts about the call. Never put a number, timeline, price, cu
 what they say unless the transcript says it; where one is needed, write a placeholder like [X weeks] or make it a
 question instead. Do not use em dashes."""
 COACH_TRANSCRIPT_CHARS = 30000   # the newest part of a long call, about 8k tokens
+KNOWLEDGE_PROMPT = """Reference notes follow: the company's point of view and passages from its knowledge base, found
+for this question. Take product, technical and positioning facts and opinions from them instead of generic advice.
+Facts about this call still come only from the transcript, which wins where they disagree.
+The notes are written for the person, not for the other side: a card's "Say:" line shows the shape of a good answer;
+"Answer", "Gruntwork view" and "Watch out" are background. Never read a note out word for word and never read
+background out as the line: pick what answers the point they just raised, and turn it into what the person says to
+the other side, in their own voice, about this call. Never state a price, even one the notes mention. Keep the
+answer as short as before."""
+KB_SCRIPT = Path(__file__).resolve().with_name("heard-kb")   # installed next to heard-ui
+_kb = {}
+
+
+def knowledge_base():
+    """The heard-kb script next to this one, loaded as a module; None when it isn't installed or can't load."""
+    if "module" not in _kb:
+        _kb["module"] = None
+        if KB_SCRIPT.exists():
+            try:
+                import importlib.machinery
+                import importlib.util
+                loader = importlib.machinery.SourceFileLoader("heard_kb", str(KB_SCRIPT))
+                spec = importlib.util.spec_from_loader("heard_kb", loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                _kb["module"] = module
+            except Exception as error:
+                print(f"heard-ui: knowledge base unavailable: {error.__class__.__name__}: {error}", file=sys.stderr)
+    return _kb["module"]
+
+
+def knowledge_status(settings):
+    """One line for Settings: what the index holds, or what is missing."""
+    kb = knowledge_base()
+    if kb is None:
+        return "heard-kb isn't installed next to heard-ui, so Ask answers from the transcript alone."
+    folder = Path(settings.get("kb_folder") or DEFAULT_SETTINGS["kb_folder"])
+    if not folder.is_dir():
+        return f"No knowledge folder at {folder} yet. Put pov.md, cards and docs there, then Build index."
+    try:
+        connection = kb.open_index(kb.DB_PATH)
+        if connection is None:
+            return "No index yet: click Build index (the first build pulls the embedding model, then takes a few minutes)."
+        passages = connection.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+        meta = dict(connection.execute("SELECT key, value FROM meta").fetchall())
+        connection.close()
+    except Exception as error:
+        return f"Could not read the index: {error}"
+    built = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(meta.get("built_at", 0))))
+    return f"{passages} passages indexed, built {built}. Rebuild after adding or editing files in the folder."
+
+
+def coach_prompt(settings, question, transcript_text):
+    """COACH_PROMPT plus the point of view and the passages heard-kb finds for this question, and the labels to show
+    under the answer. Plain COACH_PROMPT and no sources when the knowledge base is off, missing or empty."""
+    kb = knowledge_base() if settings.get("kb_enabled", True) else None
+    if kb is None:
+        return COACH_PROMPT, []
+    folder = Path(settings.get("kb_folder") or DEFAULT_SETTINGS["kb_folder"])
+    try:
+        pov = kb.point_of_view(folder)
+        passages, sources = kb.context_for(question, transcript_text, max_chars=6000)
+    except Exception as error:   # a broken index must never block an answer
+        print(f"heard-ui: knowledge base skipped: {error.__class__.__name__}: {error}", file=sys.stderr)
+        return COACH_PROMPT, []
+    if not pov and not passages:
+        return COACH_PROMPT, []
+    parts = [COACH_PROMPT, KNOWLEDGE_PROMPT]
+    if pov:
+        parts.append("Point of view:\n" + pov)
+    if passages:
+        parts.append("Knowledge passages:\n" + passages)
+    return "\n\n".join(parts), sources
 
 
 def speakable(text):
@@ -568,16 +646,21 @@ def _stream_claude(system, messages, on_text, workspace=""):
 
 
 def ask_about_call(settings, transcript_text, history, question, on_text):
-    """Stream an answer to `question` about the call. `history` is earlier [(question, answer)] of this call."""
+    """Stream an answer to `question` about the call. `history` is earlier [(question, answer)] of this call.
+    Returns the knowledge base sources the answer drew on (labels), [] when there were none."""
+    system, sources = coach_prompt(settings, question, transcript_text)
     messages = []
     for earlier_question, earlier_answer in history[-6:]:
         messages += [{"role": "user", "content": earlier_question}, {"role": "assistant", "content": earlier_answer}]
-    transcript = transcript_text[-COACH_TRANSCRIPT_CHARS:] or "(nothing transcribed yet)"
+    # the notes take room in the local model's context window; the transcript gives it up
+    budget = max(10000, COACH_TRANSCRIPT_CHARS - (len(system) - len(COACH_PROMPT)))
+    transcript = transcript_text[-budget:] or "(nothing transcribed yet)"
     messages.append({"role": "user", "content": f"Transcript so far:\n{transcript}\n\nQuestion: {question}"})
     if settings.get("summarizer") == "claude":
-        _stream_claude(COACH_PROMPT, messages, on_text, settings.get("claude_workspace", ""))
+        _stream_claude(system, messages, on_text, settings.get("claude_workspace", ""))
     else:
-        _stream_local(settings.get("local_model") or DEFAULT_SETTINGS["local_model"], COACH_PROMPT, messages, on_text)
+        _stream_local(settings.get("local_model") or DEFAULT_SETTINGS["local_model"], system, messages, on_text)
+    return sources
 
 
 # --- state --------------------------------------------------------------------------------------------
@@ -1183,6 +1266,7 @@ class ChatPane(QWidget):
         self.history = []      # [(question, answer)] of this call, sent along so follow-ups work
         self.shown = []        # what the pane shows, errors included
         self.pending = None    # [question, answer so far] while an answer streams
+        self.sources = []      # knowledge base labels the streaming answer drew on (set by the worker thread)
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
         # Follow the newest text unless the reader scrolled up (same scheme as LivePane): setHtml() resets the
@@ -1232,13 +1316,13 @@ class ChatPane(QWidget):
             self.render()
             return
         self.input.clear()
-        self.pending = [question, ""]
+        self.pending, self.sources = [question, ""], []
         self.follow = True   # a new question: show its answer as it arrives
         transcript, history = as_text(self.store.lines), list(self.history)
 
         def work():
             try:
-                ask_about_call(settings, transcript, history, question, self.delta.emit)
+                self.sources = ask_about_call(settings, transcript, history, question, self.delta.emit)
                 self.finished.emit("")
             except Exception as error:
                 self.finished.emit(describe_summary_error(error, settings).replace("try Summarize again", "ask again"))
@@ -1261,7 +1345,9 @@ class ChatPane(QWidget):
         if error:
             self.shown.append((question, (answer + "\n\n" if answer else "") + f"_Could not answer: {error}_"))
         else:
-            self.history.append((question, answer))
+            self.history.append((question, answer))   # without the sources line: it is for the reader, not the model
+            if self.sources:
+                answer += "\n\n_Sources: " + " · ".join(self.sources[:2]) + "_"
             self.shown.append((question, answer))
         self.render()
 
@@ -1637,6 +1723,23 @@ class SettingsDialog(QDialog):
         workspace_row.addWidget(find_workspace)
         self.key_status = QLabel("")
         self.key_status.setWordWrap(True)
+        # Knowledge base: a folder of markdown, docs and PDFs that heard-kb indexes for Ask (see heard-kb --help)
+        self.kb_enabled = QCheckBox("Use it for Ask (the point of view and the best-matching passages go in with each question)")
+        self.kb_enabled.setChecked(bool(store.settings.get("kb_enabled", True)))
+        self.kb_folder = QLineEdit(store.settings.get("kb_folder") or DEFAULT_SETTINGS["kb_folder"])
+        kb_browse = QPushButton("Choose…")
+        kb_browse.clicked.connect(self.choose_kb_folder)
+        self.kb_build = QPushButton("Build index")
+        self.kb_build.setToolTip("Runs heard-kb build on the folder: new and changed files are indexed, the rest kept")
+        self.kb_build.clicked.connect(self.build_index)
+        self.kb_process = None
+        kb_row = QHBoxLayout()
+        kb_row.addWidget(self.kb_folder, 1)
+        kb_row.addWidget(kb_browse)
+        kb_row.addWidget(self.kb_build)
+        self.kb_status = QLabel(knowledge_status(store.settings))
+        self.kb_status.setWordWrap(True)
+        self.kb_status.setStyleSheet("color: #888;")
 
         form = QFormLayout()
         self.form = form
@@ -1647,6 +1750,9 @@ class SettingsDialog(QDialog):
         form.addRow("Workspace ID", workspace_row)
         form.addRow("", self.key_status)
         form.addRow("Screen sharing", self.hide_from_sharing)
+        form.addRow("Knowledge folder", kb_row)
+        form.addRow("", self.kb_enabled)
+        form.addRow("", self.kb_status)
         note = QLabel(f"The rolling transcript itself lives in {DATA_DIRECTORY}, readable only by you, and is "
                       "deleted after a few days. Logs in this folder are kept until you delete them. Nothing leaves "
                       "the machine unless you choose the Claude API, which sends each transcript to Anthropic.")
@@ -1742,6 +1848,49 @@ class SettingsDialog(QDialog):
         if chosen:
             self.folder.setText(chosen)
 
+    def choose_kb_folder(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Knowledge folder", self.kb_folder.text())
+        if chosen:
+            self.kb_folder.setText(chosen)
+
+    def build_index(self):
+        """Run `heard-kb build` on the folder in the background and report what it indexed."""
+        if self.kb_process is not None:
+            return
+        folder = self.kb_folder.text().strip() or DEFAULT_SETTINGS["kb_folder"]
+        uv = shutil.which("uv")
+        if not KB_SCRIPT.exists() or not uv:
+            self.kb_status.setText("Can't build: heard-kb must be installed next to heard-ui, and uv on the PATH.")
+            return
+        if not Path(folder).is_dir():
+            self.kb_status.setText(f"No folder at {folder}.")
+            return
+        self.kb_process = QProcess(self)
+        self.kb_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.kb_process.finished.connect(self.index_built)
+        self.kb_process.start(uv, ["run", "--script", str(KB_SCRIPT), "--kb", folder, "build"])
+        self.kb_build.setEnabled(False)
+        self.kb_status.setText("Indexing... The first build pulls the embedding model (nomic-embed-text) from Ollama "
+                               "and takes a few minutes; later builds only touch changed files.")
+
+    def index_built(self, code, _status):
+        output = bytes(self.kb_process.readAllStandardOutput()).decode("utf-8", "replace")
+        self.kb_process = None
+        self.kb_build.setEnabled(True)
+        result = None
+        for line in reversed(output.strip().splitlines()):   # the result is the last line; before it, progress
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                except ValueError:
+                    pass
+                break
+        if code == 0 and result:
+            self.kb_status.setText(f"Indexed: {result.get('passages', 0)} passages from {result.get('files', 0)} files "
+                                   f"({result.get('added', 0)} new, {result.get('removed', 0)} removed).")
+        else:
+            self.kb_status.setText("Build failed: " + (output.strip().splitlines() or ["no output"])[-1][:300])
+
     def save(self):
         if self.summarizer.currentData() == "claude":
             typed = self.key.text().strip()
@@ -1767,6 +1916,8 @@ class SettingsDialog(QDialog):
         self.store.settings["local_model"] = self.local_model.text().strip() or DEFAULT_SETTINGS["local_model"]
         if not IS_LINUX:
             self.store.settings["hide_from_sharing"] = self.hide_from_sharing.isChecked()
+        self.store.settings["kb_enabled"] = self.kb_enabled.isChecked()
+        self.store.settings["kb_folder"] = self.kb_folder.text().strip() or DEFAULT_SETTINGS["kb_folder"]
         save_settings(self.store.settings)
         self.store.logs_changed.emit()
         self.store.settings_changed.emit()

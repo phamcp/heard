@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build heard-tap, install heard, heard-daemon, heard-ui and heard-tap into ~/.local/bin, and start the
+# Build heard-tap, install heard, heard-daemon, heard-ui, heard-kb and heard-tap into ~/.local/bin, and start the
 # two launchd user agents (daemon, overlay). Re-run after pulling changes. `--no-agent` only installs.
 set -eu
 cd "$(dirname "$0")/.."
@@ -21,11 +21,11 @@ swiftc -O -suppress-warnings -swift-version 5 -target "$(uname -m)-apple-macos14
     -o build/heard-tap macos/heard-tap.swift
 codesign --force --sign - build/heard-tap
 
-install -m 755 heard heard-daemon heard-ui build/heard-tap "$HOME/.local/bin/"
+install -m 755 heard heard-daemon heard-ui heard-kb build/heard-tap "$HOME/.local/bin/"
 for agent in local.heard local.heard-ui; do
     sed "s|__HOME__|$HOME|g" "launchd/$agent.plist" > "$HOME/Library/LaunchAgents/$agent.plist"
 done
-echo "installed heard, heard-daemon, heard-ui and heard-tap in ~/.local/bin"
+echo "installed heard, heard-daemon, heard-ui, heard-kb and heard-tap in ~/.local/bin"
 
 if [ "${1:-}" = "--no-agent" ]; then
     exit 0

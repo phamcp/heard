@@ -1,0 +1,434 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "numpy",
+#   "pypdf>=4",      # PDFs dropped into the knowledge folder (books, whitepapers)
+# ]
+# ///
+"""heard-kb: a local knowledge base for heard's Ask. Everything runs on this machine.
+
+The knowledge folder (default ~/Documents/heard/kb) holds markdown, text, HTML, PDF and EPUB files:
+  pov.md        Gruntwork's point of view; goes into every Ask prompt in full
+  cards/        answer cards, one "## Q: ..." section per question
+  docs/         public docs imported by `heard-kb import-docs` (Gruntwork docs, Terragrunt docs)
+  notion/       internal pages exported from Notion
+  anything else you drop in (a book as PDF, a whitepaper, a runbook)
+
+`heard-kb build` cuts the files into passages, indexes them for keyword search (SQLite FTS5) and
+meaning search (embeddings from Ollama), and stores the index in ~/.local/share/heard/kb.db. Builds
+are incremental: unchanged passages are kept. `heard-kb search "question"` shows what Ask would see.
+
+  heard-kb import-docs           clone or update the public docs into <kb>/docs (needs git)
+  heard-kb build                 (re)index the knowledge folder
+  heard-kb search "state locking in terragrunt"
+  heard-kb stats
+  heard-kb eval eval.jsonl       score the local model with and without the knowledge base
+
+Environment: HEARD_KB (folder), HEARD_KB_DB (index file), HEARD_OLLAMA_URL, HEARD_EMBED_MODEL
+(default nomic-embed-text), HEARD_MODEL_LOCAL (eval; default gemma3:12b).
+"""
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import numpy
+
+DATA_DIRECTORY = Path.home() / ".local/share/heard"
+KB_FOLDER = Path(os.environ.get("HEARD_KB") or Path.home() / "Documents/heard/kb")
+DB_PATH = Path(os.environ.get("HEARD_KB_DB") or DATA_DIRECTORY / "kb.db")
+OLLAMA_URL = os.environ.get("HEARD_OLLAMA_URL", "http://127.0.0.1:11434")
+EMBED_MODEL = os.environ.get("HEARD_EMBED_MODEL", "nomic-embed-text")
+CHUNK_CHARS = 2400          # about 600 tokens; a card stays one passage
+CHUNK_OVERLAP = 300
+SOURCE_WEIGHTS = (("cards/", 1.6), ("pov.md", 1.3), ("notion/", 1.1))   # curated answers outrank raw docs
+SKIP_FILES = {"questions.md", "readme.md", "eval.jsonl"}
+TEXT_SUFFIXES = {".md", ".mdx", ".txt", ".markdown", ".html", ".htm", ".pdf", ".epub"}
+DOC_REPOS = (("gruntwork", "https://github.com/gruntwork-io/docs", ["docs/2.0", "docs/guides", "docs/foundations",
+                                                                    "docs/discussions", "docs/library"]),
+             ("terragrunt", "https://github.com/gruntwork-io/terragrunt", ["docs/src/content/docs", "docs/src/data/faq",
+                                                                           "docs/src/data/patterns"]))
+
+
+# --- reading files ---------------------------------------------------------------------------------------
+
+def strip_mdx(text):
+    """Docusaurus / Astro markdown: drop front matter, imports, JSX tags and admonition markers; keep prose and code."""
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S)
+    text = re.sub(r"(?m)^import .*$\n?", "", text)
+    text = re.sub(r"(?m)^export .*$\n?", "", text)
+    text = re.sub(r"<[A-Z][A-Za-z0-9]*[^>]*/>", "", text)                 # <Partial />
+    text = re.sub(r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^>]*)?>", "", text)      # <Tabs> ... </Tabs>, <br>
+    text = re.sub(r"(?m)^:::\w*.*$", "", text)                            # admonitions
+    text = re.sub(r"\{/\*.*?\*/\}", "", text, flags=re.S)
+    text = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def html_to_text(text):
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", text)
+    text = re.sub(r"(?i)<h([1-6])[^>]*>(.*?)</h\1>", lambda m: "\n" + "#" * int(m.group(1)) + " " + m.group(2) + "\n", text)
+    text = re.sub(r"(?i)<(br|p|div|li|tr)[^>]*>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\n{3,}", "\n\n", html.unescape(text)).strip()
+
+
+def read_document(path):
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+        return "\n\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages)
+    if suffix == ".epub":
+        parts = []
+        with zipfile.ZipFile(path) as book:
+            for name in sorted(book.namelist()):
+                if name.lower().endswith((".xhtml", ".html", ".htm")):
+                    parts.append(html_to_text(book.read(name).decode("utf-8", "replace")))
+        return "\n\n".join(parts)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if suffix in (".html", ".htm"):
+        return html_to_text(text)
+    if suffix in (".md", ".mdx", ".markdown"):
+        return strip_mdx(text)
+    return text
+
+
+def document_title(path, text):
+    match = re.search(r"(?m)^#\s+(.+)$", text)
+    return match.group(1).strip() if match else path.stem.replace("-", " ").replace("_", " ")
+
+
+def chunk_document(path, text):
+    """Split on headings (every '## Q:' card is its own passage), then window long sections."""
+    title = document_title(path, text)
+    pieces = re.split(r"(?m)^(?=#{1,3}\s)", text)
+    chunks = []
+    for piece in pieces:
+        piece = piece.strip()
+        if len(piece) < 40:
+            continue
+        heading = re.match(r"#{1,3}\s+(.+)", piece)
+        label = f"{title} / {heading.group(1).strip()}" if heading and heading.group(1).strip() != title else title
+        start = 0
+        while start < len(piece):
+            end = min(len(piece), start + CHUNK_CHARS)
+            if end < len(piece):   # cut at a paragraph or sentence boundary when there is one nearby
+                cut = max(piece.rfind("\n\n", start + CHUNK_CHARS // 2, end), piece.rfind(". ", start + CHUNK_CHARS // 2, end))
+                if cut > start:
+                    end = cut + 1
+            chunk = piece[start:end].strip()
+            if len(chunk) >= 40:
+                chunks.append((label, chunk))
+            if end >= len(piece):
+                break
+            start = max(end - CHUNK_OVERLAP, start + 1)
+    return chunks
+
+
+def knowledge_files(folder):
+    for path in sorted(folder.rglob("*")):
+        if (path.is_file() and path.suffix.lower() in TEXT_SUFFIXES and path.name.lower() not in SKIP_FILES
+                and not any(part.startswith((".", "_")) for part in path.relative_to(folder).parts)):
+            yield path
+
+
+# --- embeddings (Ollama) -----------------------------------------------------------------------------------
+
+def _ollama(path, payload, timeout=600):
+    request = urllib.request.Request(f"{OLLAMA_URL}{path}", data=json.dumps(payload).encode("utf-8"),
+                                     headers={"content-type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # local; never through a proxy
+    with opener.open(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def embed(texts, model=EMBED_MODEL):
+    """float32 unit vectors, one per text. Pulls the model on first use."""
+    if not texts:
+        return numpy.zeros((0, 0), dtype=numpy.float32)
+    try:
+        reply = _ollama("/api/embed", {"model": model, "input": texts, "truncate": True})
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            print(f"pulling {model} ...", file=sys.stderr, flush=True)
+            _ollama("/api/pull", {"model": model, "stream": False}, timeout=3600)
+            reply = _ollama("/api/embed", {"model": model, "input": texts, "truncate": True})
+        else:
+            raise
+    vectors = numpy.asarray(reply["embeddings"], dtype=numpy.float32)
+    norms = numpy.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / numpy.maximum(norms, 1e-9)
+
+
+# --- the index -----------------------------------------------------------------------------------------------
+
+def open_index(path=DB_PATH, create=False):
+    if not create and not path.exists():
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, check_same_thread=False)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, source TEXT, label TEXT, text TEXT, "
+                       "hash TEXT UNIQUE, embedding BLOB, model TEXT)")
+    connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(label, text, content='passages', content_rowid='id')")
+    connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    return connection
+
+
+def build(folder=KB_FOLDER, db_path=DB_PATH, model=EMBED_MODEL, quiet=False):
+    """Index every file under the knowledge folder. Passages are keyed by a hash of (source, text):
+    unchanged ones keep their embedding, new ones are embedded, missing ones are deleted."""
+    folder = Path(folder)
+    if not folder.exists():
+        sys.exit(f"knowledge folder not found: {folder}")
+    connection = open_index(db_path, create=True)
+    wanted = {}
+    for path in knowledge_files(folder):
+        try:
+            text = read_document(path)
+        except Exception as error:
+            print(f"skipping {path.name}: {error}", file=sys.stderr)
+            continue
+        source = str(path.relative_to(folder)).replace(os.sep, "/")
+        for label, chunk in chunk_document(path, text):
+            key = hashlib.sha256((source + "\n" + chunk).encode("utf-8")).hexdigest()
+            wanted[key] = (source, label, chunk)
+    existing = {row[0]: row[1] for row in connection.execute("SELECT hash, model FROM passages")}
+    stale = [key for key, embedded_with in existing.items() if key not in wanted or embedded_with != model]
+    fresh = [key for key in wanted if key not in existing or existing[key] != model]
+    with connection:
+        for key in stale:
+            row = connection.execute("SELECT id, label, text FROM passages WHERE hash = ?", (key,)).fetchone()
+            connection.execute("INSERT INTO passages_fts(passages_fts, rowid, label, text) VALUES ('delete', ?, ?, ?)", row)
+            connection.execute("DELETE FROM passages WHERE id = ?", (row[0],))
+    batch = 32
+    for start in range(0, len(fresh), batch):
+        keys = fresh[start:start + batch]
+        vectors = embed([f"{wanted[k][1]}\n{wanted[k][2]}" for k in keys], model)
+        with connection:
+            for key, vector in zip(keys, vectors):
+                source, label, chunk = wanted[key]
+                cursor = connection.execute("INSERT INTO passages (source, label, text, hash, embedding, model) VALUES (?, ?, ?, ?, ?, ?)",
+                                            (source, label, chunk, key, vector.tobytes(), model))
+                connection.execute("INSERT INTO passages_fts(rowid, label, text) VALUES (?, ?, ?)", (cursor.lastrowid, label, chunk))
+        if not quiet:
+            print(f"embedded {min(start + batch, len(fresh))}/{len(fresh)}", file=sys.stderr, flush=True)
+    with connection:
+        connection.execute("INSERT OR REPLACE INTO meta VALUES ('built_at', ?)", (str(time.time()),))
+        connection.execute("INSERT OR REPLACE INTO meta VALUES ('folder', ?)", (str(folder),))
+        connection.execute("INSERT OR REPLACE INTO meta VALUES ('model', ?)", (model,))
+    total = connection.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+    return {"passages": total, "added": len(fresh), "removed": len(stale), "files": len({v[0] for v in wanted.values()})}
+
+
+def search(query, k=6, db_path=DB_PATH, model=None, connection=None):
+    """Hybrid search: keyword (BM25) and meaning (cosine), merged by reciprocal rank fusion.
+    Returns [{"source", "label", "text", "score"}] best first."""
+    connection = connection or open_index(db_path)
+    if connection is None:
+        return []
+    model = model or (connection.execute("SELECT value FROM meta WHERE key = 'model'").fetchone() or [EMBED_MODEL])[0]
+    words = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", query)
+    fts_query = " OR ".join(f'"{w}"' for w in words[:40]) if words else ""
+    keyword_ranks = {}
+    if fts_query:
+        try:
+            for rank, (rowid,) in enumerate(connection.execute(
+                    "SELECT rowid FROM passages_fts WHERE passages_fts MATCH ? ORDER BY bm25(passages_fts) LIMIT 40", (fts_query,))):
+                keyword_ranks[rowid] = rank
+        except sqlite3.OperationalError:
+            pass
+    meaning_ranks = {}
+    try:
+        vector = embed([query], model)[0]
+        rows = connection.execute("SELECT id, embedding FROM passages WHERE model = ?", (model,)).fetchall()
+        if rows:
+            matrix = numpy.frombuffer(b"".join(r[1] for r in rows), dtype=numpy.float32).reshape(len(rows), -1)
+            order = numpy.argsort(-(matrix @ vector))[:40]
+            for rank, index in enumerate(order):
+                meaning_ranks[rows[int(index)][0]] = rank
+    except Exception as error:   # Ollama down: keyword search still works
+        print(f"heard-kb: embeddings unavailable ({error.__class__.__name__}); keyword search only", file=sys.stderr)
+    scores = {}
+    for ranks in (keyword_ranks, meaning_ranks):
+        for rowid, rank in ranks.items():
+            scores[rowid] = scores.get(rowid, 0.0) + 1.0 / (60 + rank)
+    results = []
+    for rowid, score in scores.items():
+        source, label, text = connection.execute("SELECT source, label, text FROM passages WHERE id = ?", (rowid,)).fetchone()
+        weight = next((w for prefix, w in SOURCE_WEIGHTS if source.startswith(prefix)), 1.0)
+        results.append({"source": source, "label": label, "text": text, "score": round(score * weight, 4)})
+    results.sort(key=lambda hit: -hit["score"])
+    return results[:k]
+
+
+def point_of_view(folder=KB_FOLDER):
+    """pov.md, in full, for the prompt ('' when there is none)."""
+    try:
+        return (Path(folder) / "pov.md").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def context_for(question, transcript_tail="", k=6, db_path=DB_PATH, max_chars=7000):
+    """The passages Ask puts in front of the model, and the source labels to show under the answer."""
+    query = question if not transcript_tail else f"{question}\n{transcript_tail[-600:]}"
+    passages, sources, used = [], [], 0
+    for number, hit in enumerate(search(query, k=k, db_path=db_path), 1):
+        text = hit["text"][:2000]
+        if used + len(text) > max_chars:
+            break
+        used += len(text)
+        passages.append(f"[{number}] {hit['label']}\n{text}")
+        sources.append(f"{hit['label']} [{hit['source'].split('/')[0]}]")   # e.g. "Drift detection / Remediation [cards]"
+    return "\n\n".join(passages), sources
+
+
+# --- importing the public docs -------------------------------------------------------------------------------
+
+def import_docs(folder=KB_FOLDER):
+    """Clone (or update) the public Gruntwork and Terragrunt docs and copy the useful parts into <kb>/docs."""
+    folder = Path(folder)
+    cache = DATA_DIRECTORY / "kb-repos"
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, url, subdirs in DOC_REPOS:
+        repo = cache / name
+        if (repo / ".git").exists():
+            subprocess.run(["git", "-C", str(repo), "pull", "-q", "--ff-only"], check=False)
+        else:
+            subprocess.run(["git", "clone", "-q", "--depth", "1", url, str(repo)], check=True)
+        target = folder / "docs" / name
+        if target.exists():
+            for old in target.rglob("*"):
+                if old.is_file():
+                    old.unlink()
+        copied = 0
+        for sub in subdirs:
+            for path in (repo / sub).rglob("*"):
+                if path.suffix.lower() not in (".md", ".mdx") or "node_modules" in path.parts:
+                    continue
+                text = strip_mdx(path.read_text(encoding="utf-8", errors="replace"))
+                if len(text) < 200 or "Redirect to=" in text:
+                    continue
+                relative = path.relative_to(repo / sub).with_suffix(".md")
+                out = target / sub.replace("docs/", "").replace("src/content/", "").replace("src/data/", "") / relative
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(text, encoding="utf-8")
+                copied += 1
+        print(f"{name}: {copied} pages into {target}")
+
+
+# --- eval -----------------------------------------------------------------------------------------------------
+
+def ask_local(model, system, user, num_ctx=16384):
+    reply = _ollama("/api/chat", {"model": model, "stream": False, "keep_alive": "10m",
+                                  "options": {"temperature": 0.2, "num_ctx": num_ctx, "num_predict": 400},
+                                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+    return reply["message"]["content"]
+
+
+def evaluate(path, model, use_kb=True, db_path=DB_PATH, folder=KB_FOLDER, judge=None):
+    """eval.jsonl rows: {"question", "must_mention": [...], "must_not": [...]}. A row passes when the answer
+    mentions every must_mention term (case-insensitive, any alternative in a "a|b" group) and none of must_not.
+    With --judge MODEL, a local model also scores each answer 0-2 against a reference "ideal" field when present."""
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    pov = point_of_view(folder) if use_kb else ""
+    passed, scored, total_judge = 0, 0, 0
+    report = []
+    for row in rows:
+        context, sources = context_for(row["question"], db_path=db_path) if use_kb else ("", [])
+        system = ("You coach a Gruntwork sales rep on a live call. Answer in at most 3 short sentences, plain English, "
+                  "no bullets, no preamble. Use only facts from the Gruntwork point of view and the knowledge passages; "
+                  "if they do not cover it, say so.\n\n")
+        if pov:
+            system += "Gruntwork point of view:\n" + pov + "\n\n"
+        if context:
+            system += "Knowledge passages:\n" + context
+        began = time.time()
+        answer = ask_local(model, system, row["question"]).strip()
+        seconds = time.time() - began
+        low = answer.lower()
+        missing = [term for term in row.get("must_mention", []) if not any(alt.strip().lower() in low for alt in term.split("|"))]
+        forbidden = [term for term in row.get("must_not", []) if term.lower() in low]
+        ok = not missing and not forbidden
+        passed += ok
+        grade = None
+        if judge and row.get("ideal"):
+            verdict = ask_local(judge, "You grade a sales coaching answer against a reference. Reply with one digit: "
+                                       "2 if the answer conveys the reference's substance and recommendation, 1 if partly, 0 if wrong or missing.",
+                                f"Question: {row['question']}\nReference: {row['ideal']}\nAnswer: {answer}", num_ctx=4096)
+            match = re.search(r"[012]", verdict)
+            grade = int(match.group(0)) if match else 0
+            scored += grade
+            total_judge += 2
+        report.append({"question": row["question"], "pass": ok, "missing": missing, "forbidden": forbidden,
+                       "grade": grade, "seconds": round(seconds, 1), "sources": sources[:3], "answer": answer})
+        print(f"{'PASS' if ok else 'FAIL'}{'' if grade is None else f' grade {grade}'}  {row['question'][:70]}"
+              + (f"   missing {missing}" if missing else "") + (f"   forbidden {forbidden}" if forbidden else ""), flush=True)
+    summary = {"model": model, "kb": use_kb, "passed": passed, "total": len(rows),
+               "judge": f"{scored}/{total_judge}" if total_judge else None}
+    print(json.dumps(summary))
+    return summary, report
+
+
+# --- command line ---------------------------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--kb", default=str(KB_FOLDER), help="knowledge folder")
+    parser.add_argument("--db", default=str(DB_PATH), help="index file")
+    parser.add_argument("--embed-model", default=EMBED_MODEL)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("import-docs", help="clone or update the public docs into <kb>/docs")
+    commands.add_parser("build", help="index the knowledge folder")
+    commands.add_parser("stats", help="what is in the index")
+    searcher = commands.add_parser("search", help="show what Ask would retrieve")
+    searcher.add_argument("query")
+    searcher.add_argument("-k", type=int, default=6)
+    evaluator = commands.add_parser("eval", help="score the local model on a question set")
+    evaluator.add_argument("eval_file")
+    evaluator.add_argument("--model", default=os.environ.get("HEARD_MODEL_LOCAL", "gemma3:12b"))
+    evaluator.add_argument("--no-kb", action="store_true", help="baseline: no point of view, no passages")
+    evaluator.add_argument("--judge", help="a local model that also grades answers against the 'ideal' field")
+    evaluator.add_argument("--report", help="write the per-question report as JSON here")
+    arguments = parser.parse_args()
+
+    if arguments.command == "import-docs":
+        import_docs(arguments.kb)
+    elif arguments.command == "build":
+        result = build(arguments.kb, Path(arguments.db), arguments.embed_model)
+        print(json.dumps(result))
+    elif arguments.command == "stats":
+        connection = open_index(Path(arguments.db))
+        if connection is None:
+            sys.exit(f"no index at {arguments.db}; run heard-kb build")
+        meta = dict(connection.execute("SELECT key, value FROM meta").fetchall())
+        by_source = connection.execute("SELECT substr(source, 1, instr(source || '/', '/') - 1) AS top, COUNT(*) "
+                                       "FROM passages GROUP BY top ORDER BY 2 DESC").fetchall()
+        print(json.dumps({"passages": connection.execute("SELECT COUNT(*) FROM passages").fetchone()[0],
+                          "by_folder": dict(by_source), "model": meta.get("model"),
+                          "built": time.strftime("%Y-%m-%d %H:%M", time.localtime(float(meta.get("built_at", 0))))}, indent=1))
+    elif arguments.command == "search":
+        for hit in search(arguments.query, arguments.k, Path(arguments.db)):
+            print(f"--- {hit['score']}  {hit['label']}  [{hit['source']}]\n{hit['text'][:500]}\n")
+    elif arguments.command == "eval":
+        summary, report = evaluate(arguments.eval_file, arguments.model, not arguments.no_kb, Path(arguments.db),
+                                   arguments.kb, arguments.judge)
+        if arguments.report:
+            Path(arguments.report).write_text(json.dumps({"summary": summary, "rows": report}, indent=1), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

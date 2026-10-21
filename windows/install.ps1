@@ -1,4 +1,4 @@
-# Install heard on Windows. Copies heard, heard-daemon, heard-ui and the heard.cmd wrapper into
+# Install heard on Windows. Copies heard, heard-daemon, heard-ui, heard-kb and the .cmd wrappers into
 # %USERPROFILE%\.local\bin and starts heard-daemon (hidden, paused) and the heard-ui overlay at every logon:
 # as Scheduled Tasks, or as Startup-folder shortcuts if Task Scheduler refuses (some managed machines).
 #
@@ -34,7 +34,7 @@ if ($Uninstall) {
     Stop-Heard
     foreach ($task in $tasks.Values) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
     foreach ($name in $names) { Remove-Item (Join-Path $startup "$name.lnk") -ErrorAction SilentlyContinue }
-    foreach ($file in @("heard", "heard-daemon", "heard-ui", "heard.cmd", "heard-daemon.vbs", "heard-ui.vbs", "heard.vbs", "heard.ico")) {
+    foreach ($file in @("heard", "heard-daemon", "heard-ui", "heard-kb", "heard.cmd", "heard-kb.cmd", "heard-daemon.vbs", "heard-ui.vbs", "heard.vbs", "heard.ico")) {
         Remove-Item (Join-Path $bin $file) -ErrorAction SilentlyContinue
     }
     Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk") -ErrorAction SilentlyContinue
@@ -47,7 +47,8 @@ if (-not $uv) { throw "uv not found: install it first (winget install astral-sh.
 
 Stop-Heard
 New-Item -ItemType Directory -Force $bin, $data | Out-Null
-Copy-Item (Join-Path $repo "heard"), (Join-Path $repo "heard-daemon"), (Join-Path $repo "heard-ui"), (Join-Path $PSScriptRoot "heard.cmd") $bin -Force
+Copy-Item (Join-Path $repo "heard"), (Join-Path $repo "heard-daemon"), (Join-Path $repo "heard-ui"), (Join-Path $repo "heard-kb"), `
+    (Join-Path $PSScriptRoot "heard.cmd"), (Join-Path $PSScriptRoot "heard-kb.cmd") $bin -Force
 
 # A VBScript launcher runs each script with no console window and passes its exit code back to Task Scheduler.
 # Written as UTF-16 so a user folder with accents or non-Latin letters still works.
@@ -62,7 +63,7 @@ WScript.Quit shell.Run("cmd /c """"$uv"" run --script ""$script"" >> ""$log"" 2>
 "@ | Set-Content -Path $launcher -Encoding Unicode
     $launchers[$name] = $launcher
 }
-Write-Host "installed heard, heard-daemon, heard-ui and heard.cmd in $bin"
+Write-Host "installed heard, heard-daemon, heard-ui, heard-kb and their .cmd wrappers in $bin"
 
 # The desktop shortcut: make sure the daemon runs (through its task when there is one, so it keeps the
 # restart policy), then start the overlay, or bring a running one to the front (a second heard-ui does that).

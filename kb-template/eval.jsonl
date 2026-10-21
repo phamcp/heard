@@ -1,0 +1,2 @@
+{"question": "Should we keep one big state file?", "must_mention": ["split|unit|per unit|own state"], "must_not": ["dashboard"], "ideal": "Split it: one state file per unit keeps plans fast and limits blast radius.", "area": "state"}
+{"question": "Where is the UI?", "must_mention": ["git|pull request"], "must_not": [], "ideal": "The UI is your git provider: pull requests, plans and applies.", "area": "positioning"}

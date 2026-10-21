@@ -75,7 +75,7 @@ This fork adds the macOS and Windows ports, the overlay, and conservative defaul
 
 ```sh
 git clone https://github.com/phamcp/heard
-install -m 755 heard/heard heard/heard-daemon heard/heard-ui ~/.local/bin/
+install -m 755 heard/heard heard/heard-daemon heard/heard-ui heard/heard-kb ~/.local/bin/
 install -m 644 heard/systemd/heard.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now heard.service
@@ -137,7 +137,7 @@ A bar at the top of the screen, movable, on every Space, excluded from screen sh
 | **Ask** | opens or closes a chat about the live call beside the transcript, which stays on screen. Type a question or tap a quick one (Say next?, Their question?, Objections?, Recap). Answers stream in from the same AI as the summaries, using the call's transcript; follow-ups remember the conversation, and Stop recording starts a new one |
 | collapsed pill | the minimize button (**–**) shrinks the overlay to a pill: logo (click to expand), play/pause, stop, and a chat button that opens the same chat alone under the pill, without the transcript |
 | **Copy transcript** | under the transcript while a call is on screen (or a search is shown): everything shown, as text, to the clipboard |
-| ⚙ | the library folder, the AI for summaries and Ask (local model, Claude API, or off), and hiding from screen sharing |
+| ⚙ | the library folder, the AI for summaries and Ask (local model, Claude API, or off), hiding from screen sharing, and the knowledge folder Ask reads |
 | ✕ (⌘⇧H, Ctrl+Shift+H) | hide; the tray / menu bar icon brings it back |
 
 Stop recording writes the log at once, titled from the transcript's own words (its most prominent phrases, e.g.
@@ -154,6 +154,30 @@ to Settings (from the clipboard, only while the key field is empty). **Test** ch
 stores it in Windows Credential Manager, the macOS Keychain, or your Linux keyring (GNOME Keyring, KWallet); where
 there is no keyring it goes in `~/.local/share/heard/claude-api-key`, readable only by you. It never goes in the
 settings file. `ANTHROPIC_API_KEY` in the environment works too.
+
+### Teaching Ask what your company knows (`heard-kb`)
+
+Ask answers from the transcript alone until you give it a knowledge folder. `heard-kb` indexes one on this machine
+(`~/Documents/heard/kb` by default; change it in Settings) and Ask reads it on every question: the folder's `pov.md`
+goes into the prompt in full, and the passages that best match the question and the last few lines of the call are
+added next to it, with their sources shown in grey under the answer. Nothing leaves the machine when the local model
+is on; with the Claude API, the passages go to Anthropic along with the transcript.
+
+Put these in the folder:
+
+- `pov.md`: how the company thinks and talks, in under two pages. It shapes every answer, so write it as opinions,
+  not a brochure. The repo's `kb-template/pov.md` is a starting point.
+- `cards/*.md`: one `## Q: ...` section per question your team gets asked, with the answer, the company's view and
+  what to watch out for. Each card is kept whole as one passage and ranks above raw docs. `kb-template/cards/` shows
+  the shape.
+- `docs/`: `heard-kb import-docs` clones the public Gruntwork and Terragrunt docs here (needs git). Any other
+  markdown, text, HTML, PDF or EPUB works too: drop in a book, a runbook, exported wiki pages.
+
+Then build the index: **Build index** in Settings, or `heard-kb build`. It uses Ollama for embeddings
+(`nomic-embed-text`, pulled on first use, about 275 MB) next to keyword search; builds are incremental, so re-run
+it after editing files. `heard-kb search "state locking"` shows what Ask would see, `heard-kb stats` what is
+indexed, and `heard-kb eval questions.jsonl` scores the local model on your own question set with and without
+the knowledge base (`--no-kb`). If Ollama is down the index still answers by keyword.
 
 Nothing is filed or cleared until you press Stop recording: the daemon pausing itself after the
 time limit, or a restart, just pauses. Logs are kept until you delete them; the rolling transcript database
