@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, QPoint, QProcess, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QShortcut
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QGridLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizePolicy,
                                QStackedWidget, QStyle, QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
@@ -56,6 +56,7 @@ SESSION_PATH = DATA_DIRECTORY / "session.json"   # the current call's start time
 SHOW_REQUEST = DATA_DIRECTORY / "show-request"   # a second launch (desktop shortcut) asks the running overlay to show
 CAPTURABLE = bool(os.environ.get("HEARD_UI_CAPTURABLE"))   # keep the window visible to screen capture (development)
 BAR_WIDTH, BAR_HEIGHT, PANE_HEIGHT = 860, 46, 380
+APP_NAME = "Neckbeard"   # what the overlay calls itself: the tray, the shortcut, Settings. The scripts stay heard-*.
 MINI_WIDTH, MINI_HEIGHT = 144, 38   # collapsed: logo, play/pause, stop, ask
 MINI_CHAT_WIDTH, MINI_CHAT_HEIGHT = 360, 400   # collapsed with Ask open: the chat alone under the pill
 LOG_SUFFIX = " heard.md"
@@ -1665,7 +1666,7 @@ class SettingsDialog(QDialog):
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("Heard settings")
+        self.setWindowTitle(f"{APP_NAME} settings")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.folder = QLineEdit(store.settings["notes_folder"])
         browse = QPushButton("Choose…")
@@ -1681,7 +1682,7 @@ class SettingsDialog(QDialog):
         self.summarizer.setCurrentIndex(max(0, self.summarizer.findData(store.settings.get("summarizer", "local"))))
         self.local_model = QLineEdit(store.settings.get("local_model") or DEFAULT_SETTINGS["local_model"])
         self.local_model.setToolTip("Any model you have pulled in Ollama, e.g. gemma3:12b or qwen2.5:7b")
-        self.hide_from_sharing = QCheckBox("Hide Heard from screen sharing and recording (Zoom, Slack, Teams, Meet...)")
+        self.hide_from_sharing = QCheckBox(f"Hide {APP_NAME} from screen sharing and recording (Zoom, Slack, Teams, Meet...)")
         self.hide_from_sharing.setChecked(bool(store.settings.get("hide_from_sharing", True)))
         if IS_LINUX:   # X11 and Wayland have no per-window "exclude from capture"
             self.hide_from_sharing.setText("Hiding from screen sharing isn't available on Linux")
@@ -1925,17 +1926,33 @@ class SettingsDialog(QDialog):
 
 
 def tray_icon(listening, size=44):
+    """The Neckbeard mark: a round badge with a bearded face under a hat. Red while listening, grey otherwise.
+    Drawn on a 44 px grid, so it serves the tray, the collapsed pill and the desktop shortcut alike."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.scale(size / 44, size / 44)   # drawn on a 44 px grid
+    painter.scale(size / 44, size / 44)
     painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor("#ff3b30") if listening else QColor(140, 140, 140))
-    painter.drawEllipse(6, 6, 32, 32)
-    painter.setBrush(QColor(255, 255, 255, 230))
-    for i, h in enumerate((6, 12, 20, 12, 6)):   # a small waveform glyph
-        painter.drawRoundedRect(12 + i * 5, 22 - h // 2, 3, h, 1.5, 1.5)
+    badge = QColor("#ff3b30") if listening else QColor(140, 140, 140)
+    painter.setBrush(badge)
+    painter.drawEllipse(QRectF(4, 4, 36, 36))
+    beard = QPainterPath()   # from the jaw down the neck, scalloped at the bottom
+    beard.moveTo(13, 21)
+    beard.lineTo(31, 21)
+    beard.lineTo(31, 30)
+    for x in (31, 27.5, 24, 20.5, 17):
+        beard.arcTo(QRectF(x - 3.5, 27.5, 3.5, 7), 0, -180)
+    beard.lineTo(13, 30)
+    beard.closeSubpath()
+    painter.setBrush(QColor(255, 255, 255, 150))
+    painter.drawPath(beard)
+    painter.setBrush(QColor(255, 255, 255, 235))
+    painter.drawEllipse(QRectF(15.5, 13.5, 13, 13))              # face
+    painter.drawRoundedRect(QRectF(11, 13, 22, 3), 1.5, 1.5)      # hat brim
+    painter.drawRoundedRect(QRectF(16, 7, 12, 7), 2, 2)           # hat crown
+    painter.setBrush(badge)
+    painter.drawRoundedRect(QRectF(16, 10.5, 12, 1.4), 0.7, 0.7)  # hat band
     painter.end()
     return QIcon(pixmap)
 
@@ -2053,7 +2070,8 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     if sys.argv[1:2] == ["--write-icon"]:   # used by windows/install.ps1 for the desktop shortcut
         app = QApplication(sys.argv[:1])
-        written = tray_icon(False, 256).pixmap(256, 256).save(sys.argv[2], "ICO")
+        pixmap = tray_icon(False, 256).pixmap(256, 256)
+        written = pixmap.save(sys.argv[2], "ICO") if sys.argv[2].lower().endswith(".ico") else pixmap.save(sys.argv[2])
         return 0 if written else 1
     lock = None if os.environ.get("HEARD_UI_SCREENSHOT") else single_instance("ui")
     if lock is None and not os.environ.get("HEARD_UI_SCREENSHOT"):
@@ -2061,7 +2079,7 @@ def main():
         print("heard-ui: already running; asked it to show", file=sys.stderr)
         return 0
     app = QApplication(sys.argv)
-    app.setApplicationName("Heard")
+    app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
     store = Store()
 
@@ -2125,9 +2143,9 @@ def main():
     menu.addAction(QAction("Open library folder", menu, triggered=lambda: open_folder(store.settings["notes_folder"])))
     menu.addAction(QAction("Settings…", menu, triggered=open_settings))
     menu.addSeparator()
-    menu.addAction(QAction("Quit Heard", menu, triggered=app.quit))
+    menu.addAction(QAction(f"Quit {APP_NAME}", menu, triggered=app.quit))
     tray.setContextMenu(menu)
-    tray.setToolTip("heard")
+    tray.setToolTip(APP_NAME)
     tray.show()
     store.changed.connect(lambda: tray.setIcon(tray_icon(store.listening)))
 

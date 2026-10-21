@@ -37,7 +37,7 @@ if ($Uninstall) {
     foreach ($file in @("heard", "heard-daemon", "heard-ui", "heard-kb", "heard.cmd", "heard-kb.cmd", "heard-daemon.vbs", "heard-ui.vbs", "heard.vbs", "heard.ico")) {
         Remove-Item (Join-Path $bin $file) -ErrorAction SilentlyContinue
     }
-    Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk") -ErrorAction SilentlyContinue
+    foreach ($name in @("Neckbeard.lnk", "Heard.lnk")) { Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) $name) -ErrorAction SilentlyContinue }
     Write-Host "heard is uninstalled. Transcripts stay in $data, call logs in $env:USERPROFILE\Documents\heard."
     exit 0
 }
@@ -77,15 +77,16 @@ shell.Run "wscript.exe ""$($launchers['heard-ui'])""", 0, False
 "@ | Set-Content -Path $opener -Encoding Unicode
 $icon = Join-Path $bin "heard.ico"
 & $uv run --script (Join-Path $bin "heard-ui") --write-icon $icon 2>$null | Out-Null
-$desktopLink = Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk"
+$desktopLink = Join-Path ([Environment]::GetFolderPath("Desktop")) "Neckbeard.lnk"
+Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "Heard.lnk") -ErrorAction SilentlyContinue   # the old name
 $link = (New-Object -ComObject WScript.Shell).CreateShortcut($desktopLink)
 $link.TargetPath = "wscript.exe"
 $link.Arguments = "`"$opener`""
 $link.WorkingDirectory = $bin
-$link.Description = "Heard: local call transcripts. Opens the overlay; nothing is captured until you press Start listening."
+$link.Description = "Neckbeard: local call transcripts. Opens the overlay; nothing is captured until you press Start listening."
 if (Test-Path $icon) { $link.IconLocation = "$icon,0" }
 $link.Save()
-Write-Host "added a Heard shortcut to your desktop"
+Write-Host "added a Neckbeard shortcut to your desktop"
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not $userPath -or ($userPath -split ";") -notcontains $bin) {

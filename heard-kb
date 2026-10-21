@@ -86,9 +86,16 @@ def html_to_text(text):
 
 def read_document(path):
     suffix = path.suffix.lower()
-    if suffix == ".pdf":
+    if suffix == ".pdf":   # a book: its title from the PDF metadata, a heading every ten pages so passages say where they are
         from pypdf import PdfReader
-        return "\n\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages)
+        reader = PdfReader(str(path))
+        title = (reader.metadata.title if reader.metadata else "") or path.stem
+        parts = [f"# {title.strip()}"]
+        for number, page in enumerate(reader.pages, 1):
+            if number % 10 == 1:
+                parts.append(f"## pp. {number}-{min(number + 9, len(reader.pages))}")
+            parts.append(re.sub("[\u2010\u00ad]\n", "", page.extract_text() or ""))   # re-join words hyphenated across lines
+        return "\n\n".join(parts)
     if suffix == ".epub":
         parts = []
         with zipfile.ZipFile(path) as book:
@@ -348,9 +355,9 @@ def evaluate(path, model, use_kb=True, db_path=DB_PATH, folder=KB_FOLDER, judge=
     report = []
     for row in rows:
         context, sources = context_for(row["question"], db_path=db_path) if use_kb else ("", [])
-        system = ("You coach a Gruntwork sales rep on a live call. Answer in at most 3 short sentences, plain English, "
-                  "no bullets, no preamble. Use only facts from the Gruntwork point of view and the knowledge passages; "
-                  "if they do not cover it, say so.\n\n")
+        system = "You coach a Gruntwork sales rep on a live call. Answer in at most 3 short sentences, plain English, no bullets, no preamble. "
+        system += ("Use only facts from the Gruntwork point of view and the knowledge passages; if they do not cover it, say so.\n\n"
+                   if use_kb else "Answer from what you know about Gruntwork, Terragrunt, OpenTofu and infrastructure as code.\n\n")
         if pov:
             system += "Gruntwork point of view:\n" + pov + "\n\n"
         if context:
@@ -367,7 +374,7 @@ def evaluate(path, model, use_kb=True, db_path=DB_PATH, folder=KB_FOLDER, judge=
         if judge and row.get("ideal"):
             verdict = ask_local(judge, "You grade a sales coaching answer against a reference. Reply with one digit: "
                                        "2 if the answer conveys the reference's substance and recommendation, 1 if partly, 0 if wrong or missing.",
-                                f"Question: {row['question']}\nReference: {row['ideal']}\nAnswer: {answer}", num_ctx=4096)
+                                f"Question: {row['question']}\nReference: {row['ideal']}\nAnswer: {answer}")   # same num_ctx as the answers, or Ollama reloads the model every call
             match = re.search(r"[012]", verdict)
             grade = int(match.group(0)) if match else 0
             scored += grade

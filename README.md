@@ -33,7 +33,8 @@ later in the overlay's Library.
     and the default microphone
 
 This fork adds the macOS and Windows ports, the overlay, and conservative defaults to
-[ZachGoldberg/heard](https://github.com/ZachGoldberg/heard).
+[ZachGoldberg/heard](https://github.com/ZachGoldberg/heard). The overlay calls itself **Neckbeard** (the tray icon,
+the desktop shortcut and Settings carry the name and the bearded mark); the scripts and folders keep the `heard` name.
 
 ## Privacy defaults
 
